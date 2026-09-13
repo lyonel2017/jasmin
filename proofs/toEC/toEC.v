@@ -32,6 +32,9 @@ Module Import E.
 
   Definition pass : string := "to pwhile".
 
+  Definition typing_error (ii : instr_info) :=
+    pp_internal_error_s_at pass ii "wrong type".
+
   Definition arity_error (ii : instr_info) :=
     pp_internal_error_s_at pass ii "wrong number of arguments".
 
@@ -148,19 +151,8 @@ Context
 
 #[local] Existing Instance progUnit.
 
-Context
-  (* Keyed on the whole [var], not just its name: [eval_atype] is not
-     injective ([aarr U8 4] and [aarr U32 1] both give [carr 4]), so two
-     Jasmin variables differing only in [atype] would otherwise share a
-     pwhile location.  Injectivity is needed only on the proof side. *)
-  (to_ident : var -> nat)
-  (to_fname : funname -> nat)
-.
+Context (to_ident : var -> nat) (to_fname : funname -> nat).
 
-(* [cmd_ A ident (cmem A ident) ident] forces procedure names and variable
-   names into the *same* type, and the memory cell needs a third slot;
-   [xO]/[xI]-style tagging makes the three ranges disjoint by
-   construction, so only injectivity of [to_ident]/[to_fname] is assumed. *)
 Definition pw_var_id (x : var)     : jident := (to_ident x).*2.+2.
 Definition pw_fun_id (f : funname) : jident := (to_fname f).*2.+3.
 Definition pw_mem_id               : jident := 0.
@@ -224,43 +216,14 @@ Definition pwargs (ii : instr_info) (ts : seq ctype) (tes : seq texp) :
   if size ts == size tes then ok (pwargs_aux ts tes)
   else Error (arity_error ii).
 
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 (* 3. Expressions                                                       *)
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 
 Definition pwgvar (x : gvar) : texp :=
   let xv := (gv x).(v_var) in
   mk_texp (eval_atype (jtype xv))
     (if x.(gs) is Slocal then var_ (pwvar xv) else gvar_ (pwvar xv)).
-
-(* Array reads and writes need the array *length*, which lives in the
-   code; a dependent match on the code exposes it.  The non-array branches
-   are unreachable for a well-typed program. *)
-Definition arr_get (al : aligned) (aa : arr_access) (ws : wsize)
-    (te : texp) (ei : pexp (interp cint)) : pexp (interp (cword ws)) :=
-  let: existT t e := te in
-  (match t return pexp (interp t) -> pexp (interp (cword ws)) with
-   | carr n  => fun e =>
-       app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) =>
-                           rdflt 0%R (WArray.get al aa ws a k))) e) ei
-   | cbool   => fun _ => cst_ 0%R
-   | cint    => fun _ => cst_ 0%R
-   | cword _ => fun _ => cst_ 0%R
-   end) e.
-
-Definition arr_get_sub (aa : arr_access) (ws : wsize) (len : Z)
-    (te : texp) (ei : pexp (interp cint))
-  : pexp (interp (carr (arr_size ws len))) :=
-  let: existT t e := te in
-  (match t return pexp (interp t) -> pexp (interp (carr (arr_size ws len))) with
-   | carr n  => fun e =>
-       app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) =>
-                           rdflt (WArray.empty (arr_size ws len))
-                                 (WArray.get_sub aa ws len a k))) e) ei
-   | cbool   => fun _ => cst_ (WArray.empty _)
-   | cint    => fun _ => cst_ (WArray.empty _)
-   | cword _ => fun _ => cst_ (WArray.empty _)
-   end) e.
 
 Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
   match e with
@@ -275,12 +238,33 @@ Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
 
   | Pget al aa ws x i =>
       Let ti := toEC_e ii i in
-      ok (mk_texp (cword ws) (arr_get al aa ws (pwgvar x) (cast_e cint ti)))
+      let ei := (cast_e cint ti) in
+      let: existT t e := (pwgvar x) in
+      (match t return pexp (interp t) -> cexec texp with
+       | carr n  => fun e =>
+                     let e :=
+                       app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) =>
+                                           rdflt 0%R (WArray.get al aa ws a k))) e) ei
+                     in
+                     ok (mk_texp (cword ws) e)
+       | _   => fun _ => Error (typing_error ii)
+       end) e
+
 
   | Psub aa ws len x i =>
       Let ti := toEC_e ii i in
-      ok (mk_texp (carr (arr_size ws len))
-            (arr_get_sub aa ws len (pwgvar x) (cast_e cint ti)))
+          let ei := (cast_e cint ti) in
+          let: existT t e := (pwgvar x) in
+          (match t return pexp (interp t) -> cexec texp with
+           | carr n  => fun e =>
+                         let e :=
+                         app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) =>
+                                             rdflt (WArray.empty (arr_size ws len))
+                                               (WArray.get_sub aa ws len a k))) e) ei
+                         in
+                         ok (mk_texp (carr (arr_size ws len)) e)
+           | _=> fun _ => Error (typing_error ii)
+           end) e
 
   | Pload al ws a =>
       Let ta := toEC_e ii a in
@@ -291,8 +275,6 @@ Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
                      (gvar_ memv))
                   (cast_e (cword Uptr) ta)))
 
-  (* [of_interp] is applied *inside* the closure, so the closure's own type
-     is [interp t1 -> interp t2] -- small enough to index [expr_]. *)
   | Papp1 o e1 =>
       Let t1 := toEC_e ii e1 in
       ok (mk_texp (eval_atype (type_of_op1 o).2)
@@ -341,21 +323,6 @@ Definition toEC_es (ii : instr_info) (es : pexprs) : cexec (seq texp) :=
   mapM (toEC_e ii) es.
 
 (* -------------------------------------------------------------------- *)
-(* Assertions.  [Cassert] becomes [If b then skip else abort]: [abort]
-   denotes [dnull], so a failed assertion has no behaviour -- which is
-   what Jasmin's [sem_assert] raising [ErrAssert] should map to.
-
-   Two of the five [eassert] forms have no counterpart in this model and
-   are over-approximated by [true]: every pwhile variable holds a value,
-   and every address of the memory cell is readable.  That is sound in
-   the direction the theorem is stated -- where Jasmin's check is false,
-   [sem_assert] errors and the statement's left-hand [errcutoff]
-   discharges the obligation.  [sem_assert]'s [assert_allowed] guard is
-   dropped for the same reason.
-
-   Note this makes the translation total on [Cassert], so it no longer
-   depends on [remove_assert] (run inside [legalize_names]) having
-   removed them: a program that still carries assertions translates. *)
 Fixpoint toEC_assert (ii : instr_info) (a : eassert) : cexec (pexp bool) :=
   match a with
   | Pexpr e =>
@@ -377,9 +344,9 @@ Fixpoint toEC_assert (ii : instr_info) (a : eassert) : cexec (pexp bool) :=
       ok (app_ (app_ (cst_ andb) b1) b2)
   end.
 
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 (* 4. Left-hand sides                                                   *)
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 
 (* Parallel assignment.  [block bs skip rs] evaluates [bs] in the *outer*
    memory into a frame that [minit]'s [mnew] has just wiped, then [mret]
@@ -396,37 +363,6 @@ Definition passign (bs : seq binding) : pwcmd :=
   pwhile.block bs pwhile.skip
     (map (fun b => let: existT _ (x, _) := b in bind_of x (var_ x)) bs).
 
-(* An array/memory write, with the length again exposed by a match. *)
-Definition arr_set_cmd (al : aligned) (aa : arr_access) (ws : wsize)
-    (x : var) (ei : pexp (interp cint)) (ev : pexp (interp (cword ws))) : pwcmd :=
-  (match eval_atype (jtype x) as c
-     return vars_ jident c -> pwcmd with
-   | carr n  => fun v =>
-       pwhile.assign v
-         (app_ (app_ (app_
-                  (cst_ (fun (a : WArray.array n) (k : Z) (w : word ws) =>
-                           rdflt a (WArray.set a al aa k w))) (var_ v)) ei) ev)
-   | cbool   => fun _ => pwhile.skip
-   | cint    => fun _ => pwhile.skip
-   | cword _ => fun _ => pwhile.skip
-   end) (pwvar x).
-
-Definition arr_setsub_cmd (aa : arr_access) (ws : wsize) (len : Z)
-    (x : var) (ei : pexp (interp cint))
-    (ev : pexp (interp (carr (arr_size ws len)))) : pwcmd :=
-  (match eval_atype (jtype x) as c
-     return vars_ jident c -> pwcmd with
-   | carr n  => fun v =>
-       pwhile.assign v
-         (app_ (app_ (app_
-                  (cst_ (fun (a : WArray.array n) (k : Z)
-                             (b : WArray.array (arr_size ws len)) =>
-                           rdflt a (WArray.set_sub aa a k b))) (var_ v)) ei) ev)
-   | cbool   => fun _ => pwhile.skip
-   | cint    => fun _ => pwhile.skip
-   | cword _ => fun _ => pwhile.skip
-   end) (pwvar x).
-
 Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd :=
   match lv with
   | Lnone _ _ => ok pwhile.skip
@@ -437,12 +373,33 @@ Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd :=
 
   | Laset al aa ws x i =>
       Let ti := toEC_e ii i in
-      ok (arr_set_cmd al aa ws x.(v_var) (cast_e cint ti) (cast_e (cword ws) te))
+      let ei := (cast_e cint ti) in
+      let ev := (cast_e (cword ws) te) in
+      (match eval_atype (jtype x) as c
+             return vars_ jident c -> cexec pwcmd  with
+       | carr n  => fun v =>
+                 ok (pwhile.assign v
+                  (app_ (app_ (app_
+                  (cst_ (fun (a : WArray.array n) (k : Z) (w : word ws) =>
+                   rdflt a (WArray.set a al aa k w))) (var_ v)) ei) ev))
+       | _ => fun _ => Error (typing_error ii)
+       end) (pwvar x)
 
   | Lasub aa ws len x i =>
       Let ti := toEC_e ii i in
-      ok (arr_setsub_cmd aa ws len x.(v_var) (cast_e cint ti)
-            (cast_e (carr (arr_size ws len)) te))
+      let ei := (cast_e cint ti) in
+      let ev := (cast_e (carr (arr_size ws len)) te) in
+
+      (match eval_atype (jtype x) as c
+             return vars_ jident c -> cexec pwcmd with
+       | carr n  => fun v =>
+                     ok (pwhile.assign v
+                           (app_ (app_ (app_
+                                   (cst_ (fun (a : WArray.array n) (k : Z)
+                                   (b : WArray.array (arr_size ws len)) =>
+                              rdflt a (WArray.set_sub aa a k b))) (var_ v)) ei) ev))
+       | _ => fun _ => Error (typing_error ii)
+       end) (pwvar x)
 
   | Lmem al ws _ a =>
       Let ta := toEC_e ii a in
@@ -456,7 +413,6 @@ Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd :=
                   (cast_e (cword ws) te)))
   end.
 
-(* Sequential writes, used when there is at most one destination. *)
 Fixpoint toEC_lvs_seq (ii : instr_info) (lvs : lvals) (tes : seq texp) :
     cexec pwcmd :=
   match lvs, tes with
@@ -468,9 +424,6 @@ Fixpoint toEC_lvs_seq (ii : instr_info) (lvs : lvals) (tes : seq texp) :
   | _, _ => Error (arity_error ii)
   end.
 
-(* Two or more destinations: they are pairwise-distinct [Lvar]s (by
-   [normalize_calls]), so one parallel assignment is both correct and free
-   of auxiliaries. *)
 Fixpoint lvs_bindings (ii : instr_info) (lvs : lvals) (tes : seq texp) :
     cexec (seq binding) :=
   match lvs, tes with
@@ -487,26 +440,17 @@ Definition toEC_lvs (ii : instr_info) (lvs : lvals) (tes : seq texp) :
   if (size lvs <= 1)%nat then toEC_lvs_seq ii lvs tes
   else Let bs := lvs_bindings ii lvs tes in ok (passign bs).
 
-(* [random] demands the sampled distribution be at the variable's own
-   code, so the destination's array length has to be exposed before
-   [drandbytes] fits.  [normalize_calls] guarantees it is an array. *)
 Definition rand_assign (ii : instr_info) (x : var) : cexec pwcmd :=
   (match eval_atype (jtype x) as c
      return vars_ jident c -> cexec pwcmd with
    | carr n  => fun v => ok (pwhile.random v (cst_ (drandbytes n)))
-   | cbool   => fun _ => Error (syscall_error ii)
-   | cint    => fun _ => Error (syscall_error ii)
-   | cword _ => fun _ => Error (syscall_error ii)
+   | _ => fun _ => Error (syscall_error ii)
    end) (pwvar x).
 
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 (* 5. Instructions                                                      *)
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 
-(* A call frame: arguments are evaluated in the caller's memory by
-   [minit], results are read out of the callee's final memory by [mret],
-   which also restores the caller's locals while keeping the callee's
-   globals -- so Jasmin's memory threading through calls is preserved. *)
 Definition call_cmd (fd : _ufundef) (fn : funname) (ii : instr_info)
     (lvs : lvals) (tes : seq texp) : cexec pwcmd :=
   Let bs :=
@@ -522,11 +466,6 @@ Definition call_cmd (fd : _ufundef) (fn : funname) (ii : instr_info)
   Let rs := lvs_bindings ii lvs res in
   ok (pwhile.block bs (pwhile.call (pw_fun_id fn)) rs).
 
-(* Same shape as the other passes (cf. [flatten_while.v:12-22]): the
-   command-level fold takes the instruction-level translation as a
-   parameter, so the recursion below is structural on [instr] alone.
-   [cmd] is pwhile's notation here, so Jasmin commands are spelled
-   [seq instr] throughout this file. *)
 Section CMD.
 
 Context (toEC_i : instr -> cexec pwcmd).
@@ -549,10 +488,6 @@ Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd :=
       Let te := toEC_e ii e in
       toEC_lv ii lv (mk_texp (eval_atype ty) (cast_e (eval_atype ty) te))
 
-  (* One closure per output position.  [semi] is a pure function of the
-     arguments, and all copies read the same [args] expression -- which
-     [passign] evaluates once, in the caller's memory -- so the
-     duplication is syntactic only. *)
   | Copn lvs _ o es =>
       Let tes := toEC_es ii es in
       let d := get_instr_desc o in
@@ -603,13 +538,10 @@ Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd :=
 Definition toEC_c (p : _uprog) (c : seq instr) : cexec pwcmd :=
   toEC_c_aux (toEC_i p) c.
 
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 (* 6. Programs                                                          *)
-(* ==================================================================== *)
+(* -------------------------------------------------------------------- *)
 
-(* Function bodies need no prologue: [minit]'s [mnew] wipes the frame to
-   [witness], and [init_local_arrays] has already emitted an explicit
-   [Parr_init] assignment for every local array. *)
 Definition toEC_fd (p : _uprog) (fd : _ufundef) : cexec pwcmd :=
   toEC_c p fd.(f_body).
 
@@ -628,14 +560,9 @@ Fixpoint pw_assoc (l : seq (jident * pwcmd)) (f : jident) : pwcmd :=
   | gc :: l' => if gc.1 == f then gc.2 else pw_assoc l' f
   end.
 
-(* [abort] as the default for an unknown name is unreachable for accepted
-   programs -- [normalize_calls] rejects calls to unknown functions, and so
-   does [Ccall] above -- and it denotes [dnull], which is below everything
-   in the refinement order anyway. *)
 Definition toEC_ps (p : _uprog) : cexec (jident -> pwcmd) :=
   Let l := toEC_funcs p in ok (pw_assoc l).
 
-(* Compile-time data: one [gassign] per global constant. *)
 Definition toEC_glob (gd : glob_decl) : pwcmd :=
   let: (x, g) := gd in
   match g with
