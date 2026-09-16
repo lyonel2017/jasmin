@@ -9,9 +9,10 @@ From mathcomp.classical Require Import boolp.
 From mathcomp.reals Require Import reals.
 From mathcomp.analysis Require Import counting_distr.
 Require Import compiler_util expr arch_decl arch_extra.
-Require Import utils type sem_type sem_op_typed values warray_ word wsize.
+Require Import utils type sem_type sem_op_typed values varmap low_memory warray_ word wsize.
 Require Import sopn syscall global psem_defs.
-From xhl.pwhile Require Import inhabited pwhile.
+
+From xhl.pwhile Require Import inhabited mem pwhile.
 
 Unset Implicit Arguments.
 Set Strict Implicit.
@@ -142,439 +143,619 @@ Definition drandbytes {R: realType} (len : Z) : { distr (WArray.array len) / R }
 (* Translation                                                          *)
 (* -------------------------------------------------------------------- *)
 
-Section TOEC.
-Context {R: realType}.
-Context
-  {reg regx xreg rflag cond asm_op extra_op : Type}
-  {asm_e : asm_extra reg regx xreg rflag cond asm_op extra_op}
-.
+Section Mem.
+  Context {R: realType}.
+  Context {wsw:WithSubWord}.
+  Context {pd: PointerData}.
+  Context {gd: glob_decls}.
+  Context {wdb : bool}.
 
-#[local] Existing Instance progUnit.
+Record jstate := Jstate {
+    emem : mem;
+    evm  : Vm.t
+  }.
 
-Context (to_ident : var -> nat) (to_fname : funname -> nat).
+Definition var_type (v: var_i) :=
+    let var   := v_var v in
+    let vtype := Var.vtype var in
+    eval_atype vtype.
 
-Definition pw_var_id (x : var)     : jident := (to_ident x).*2.+2.
-Definition pw_fun_id (f : funname) : jident := (to_fname f).*2.+3.
-Definition pw_mem_id               : jident := 0.
-
-Notation pexp T := (expr_ jcode jident (cmem jcode jident) T).
-Notation pwcmd  := (@cmd_ R jcode jident (cmem jcode jident) jident).
-
-Definition pwvar (x : var) : vars_ jident (eval_atype (jtype x)) :=
-  pwhile.Var (eval_atype (jtype x)) (pw_var_id x).
-
-(* Jasmin's memory is one global array cell, [wbase Uptr] bytes wide.
-   Validity and alignment are replaced by [WArray]'s bounds -- the
-   "total denotations with defaults" convention -- but word access reuses
-   Jasmin's own [WArray.get]/[WArray.set] at [AAdirect] (scale 1). *)
-Definition mem_size : Z := wbase Uptr.
-
-Definition memv : vars_ jident (carr mem_size) :=
-  pwhile.Var (carr mem_size) pw_mem_id.
-
-(* a translated expression, together with its Jasmin type *)
-Definition texp := { t : ctype & pexp (interp t) }.
-
-Definition mk_texp (t : ctype) (e : pexp (interp t)) : texp := existT _ t e.
-Arguments mk_texp : clear implicits.
-
-Definition texp_ty (te : texp) : ctype := projT1 te.
-
-(* -------------------------------------------------------------------- *)
-(* Coercion.  Rather than transporting along a [ctype] equality (which
-   would need an [eq_rect] at every operand), a coercion is *always*
-   applied, exactly as Jasmin's own [truncate_val = of_val . to_val].
-   When the types already agree this is semantically the identity
-   ([of_val t (to_val x) = ok x]), so nothing is lost, and the definition
-   is total -- no [cexec], no dependent pattern matching. *)
-Definition coerce (tsrc tdst : ctype) (e : pexp (interp tsrc)) : pexp (interp tdst) :=
-  app_ (cst_ (fun v => tot tdst (of_val tdst (jval tsrc v)))) e.
-Arguments coerce : clear implicits.
-
-Definition cast_e (tdst : ctype) (te : texp) : pexp (interp tdst) :=
-  let: existT tsrc e := te in coerce tsrc tdst e.
-Arguments cast_e : clear implicits.
-
-(* -------------------------------------------------------------------- *)
-(* Operator arguments, as one [expr_] over [values].
-
-   [expr_] *can* now be instantiated at [value]/[values] (it could not
-   under the old stack, which is why an auxiliary small sum type was
-   needed); it still cannot be instantiated at [exec _] or [sem_prod _ _],
-   so operators are applied through a value list with [app_sopn]/
-   [app_sopn_v] inside a closure rather than by currying [sem_prod]. *)
-Fixpoint pwargs_aux (ts : seq ctype) (tes : seq texp) : pexp values :=
-  match ts, tes with
-  | t :: ts', te :: tes' =>
-      app_ (app_ (cst_ (@cons value)) (app_ (cst_ (jval t)) (cast_e t te)))
-           (pwargs_aux ts' tes')
-  | _, _ => cst_ [::]
+Definition to_bool v :=
+  match v with
+  | Vbool b => b
+  | _ => @witness (interp cbool)
   end.
 
-Definition pwargs (ii : instr_info) (ts : seq ctype) (tes : seq texp) :
-    cexec (pexp values) :=
-  if size ts == size tes then ok (pwargs_aux ts tes)
-  else Error (arity_error ii).
-
-(* -------------------------------------------------------------------- *)
-(* 3. Expressions                                                       *)
-(* -------------------------------------------------------------------- *)
-
-Definition pwgvar (x : gvar) : texp :=
-  let xv := (gv x).(v_var) in
-  mk_texp (eval_atype (jtype xv))
-    (if x.(gs) is Slocal then var_ (pwvar xv) else gvar_ (pwvar xv)).
-
-Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
-  match e with
-  | Pconst z => ok (mk_texp cint (cst_ z))
-
-  | Pbool b => ok (mk_texp cbool (cst_ b))
-
-  | Parr_init ws n =>
-      ok (mk_texp (carr (arr_size ws n)) (cst_ (WArray.empty (arr_size ws n))))
-
-  | Pvar x => ok (pwgvar x)
-
-  | Pget al aa ws x i =>
-      Let ti := toEC_e ii i in
-      let ei := (cast_e cint ti) in
-      let: existT t e := (pwgvar x) in
-      (match t return pexp (interp t) -> cexec texp with
-       | carr n  => fun e =>
-                     let e :=
-                       app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) =>
-                                           rdflt 0%R (WArray.get al aa ws a k))) e) ei
-                     in
-                     ok (mk_texp (cword ws) e)
-       | _   => fun _ => Error (typing_error ii)
-       end) e
-
-
-  | Psub aa ws len x i =>
-      Let ti := toEC_e ii i in
-          let ei := (cast_e cint ti) in
-          let: existT t e := (pwgvar x) in
-          (match t return pexp (interp t) -> cexec texp with
-           | carr n  => fun e =>
-                         let e :=
-                         app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) =>
-                                             rdflt (WArray.empty (arr_size ws len))
-                                               (WArray.get_sub aa ws len a k))) e) ei
-                         in
-                         ok (mk_texp (carr (arr_size ws len)) e)
-           | _=> fun _ => Error (typing_error ii)
-           end) e
-
-  | Pload al ws a =>
-      Let ta := toEC_e ii a in
-      ok (mk_texp (cword ws)
-            (app_ (app_ (cst_ (fun (m : WArray.array mem_size) (p : word Uptr) =>
-                                 rdflt 0%R
-                                   (WArray.get al AAdirect ws m (wunsigned p))))
-                     (gvar_ memv))
-                  (cast_e (cword Uptr) ta)))
-
-  | Papp1 o e1 =>
-      Let t1 := toEC_e ii e1 in
-      ok (mk_texp (eval_atype (type_of_op1 o).2)
-            (app_ (cst_ (fun v =>
-                     tot (eval_atype (type_of_op1 o).2)
-                       (sem_sop1_typed o
-                          (of_interp (eval_atype (type_of_op1 o).1) v))))
-                  (cast_e (eval_atype (type_of_op1 o).1) t1)))
-
-  | Papp2 o e1 e2 =>
-      Let t1 := toEC_e ii e1 in
-      Let t2 := toEC_e ii e2 in
-      ok (mk_texp (eval_atype (type_of_op2 o).2)
-            (app_ (app_ (cst_ (fun v1 v2 =>
-                       tot (eval_atype (type_of_op2 o).2)
-                         (sem_sop2_typed o
-                            (of_interp (eval_atype (type_of_op2 o).1.1) v1)
-                            (of_interp (eval_atype (type_of_op2 o).1.2) v2))))
-                     (cast_e (eval_atype (type_of_op2 o).1.1) t1))
-                  (cast_e (eval_atype (type_of_op2 o).1.2) t2)))
-
-  | PappN o es =>
-      Let tes := mapM (toEC_e ii) es in
-      Let args := pwargs ii (map eval_atype (type_of_opN o).1) tes in
-      ok (mk_texp (eval_atype (type_of_opN o).2)
-            (app_ (cst_ (fun vs =>
-                     tot (eval_atype (type_of_opN o).2)
-                       (app_sopn (map eval_atype (type_of_opN o).1)
-                          (sem_opN_typed o) vs)))
-                  args))
-
-  | Pif ty b e1 e2 =>
-      Let tb := toEC_e ii b in
-      Let t1 := toEC_e ii e1 in
-      Let t2 := toEC_e ii e2 in
-      ok (mk_texp (eval_atype ty)
-            (app_ (app_ (app_
-                     (cst_ (fun (c : bool) (v1 v2 : interp (eval_atype ty)) =>
-                              if c then v1 else v2))
-                     (cast_e cbool tb))
-                     (cast_e (eval_atype ty) t1))
-                  (cast_e (eval_atype ty) t2)))
+Definition to_int v :=
+  match v with
+  | Vint i => i
+  | _ => @witness (interp cint)
   end.
 
-Definition toEC_es (ii : instr_info) (es : pexprs) : cexec (seq texp) :=
-  mapM (toEC_e ii) es.
+Definition cast len' len (a:WArray.array len'): (WArray.array len)  :=
+  if len' == len then {| WArray.arr_data := a.(WArray.arr_data) |}
+  else @witness (interp (carr len)).
 
-(* -------------------------------------------------------------------- *)
-Fixpoint toEC_assert (ii : instr_info) (a : eassert) : cexec (pexp bool) :=
-  match a with
-  | Pexpr e =>
-      Let te := toEC_e ii e in
-      ok (cast_e cbool te)
-
-  | PappN_safety o es =>
-      Let tes := toEC_es ii es in
-      Let args := pwargs ii (map eval_atype (type_of_opN_safety o).1) tes in
-      ok (app_ (cst_ (fun vs => rdflt false (sem_opN_safety o vs))) args)
-
-  | Pis_var_init _ => ok (cst_ true)
-
-  | Pis_mem_init _ _ => ok (cst_ true)
-
-  | Pand a1 a2 =>
-      Let b1 := toEC_assert ii a1 in
-      Let b2 := toEC_assert ii a2 in
-      ok (app_ (app_ (cst_ andb) b1) b2)
+Definition to_arr len v :=
+  match v with
+  | Varr len' t => cast len' len t
+  | _ => @witness (interp (carr len))
   end.
 
-(* -------------------------------------------------------------------- *)
-(* 4. Left-hand sides                                                   *)
-(* -------------------------------------------------------------------- *)
+(* Definition truncate_word s s' (w:word s') : (word s) := *)
+(*   match gcmp s s' as c return gcmp s s' = c → exec (word s) with *)
+(*   | Eq => λ h, ok (ecast s (word s) (esym (cmp_eq h)) w) *)
+(*   | Lt => λ _, ok (zero_extend s w) *)
+(*   | Gt => λ _, @witness (interp (cword s)) *)
+(*   end erefl. *)
 
-(* Parallel assignment.  [block bs skip rs] evaluates [bs] in the *outer*
-   memory into a frame that [minit]'s [mnew] has just wiped, then [mret]
-   restores the outer locals and evaluates [rs] in that frame.  Reading
-   each bound variable straight back therefore performs a simultaneous
-   assignment -- with no auxiliary names to invent, and without
-   re-evaluating right-hand sides that a destination may clobber
-   ([normalize_calls] does not make destinations disjoint from the
-   arguments' reads). *)
-Definition pw_bind (x : var) (te : texp) : binding :=
-  bind_of (pwvar x) (cast_e (eval_atype (jtype x)) te).
-
-Definition passign (bs : seq binding) : pwcmd :=
-  pwhile.block bs pwhile.skip
-    (map (fun b => let: existT _ (x, _) := b in bind_of x (var_ x)) bs).
-
-Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd :=
-  match lv with
-  | Lnone _ _ => ok pwhile.skip
-
-  | Lvar x =>
-      ok (pwhile.assign (pwvar x.(v_var))
-            (cast_e (eval_atype (jtype x.(v_var))) te))
-
-  | Laset al aa ws x i =>
-      Let ti := toEC_e ii i in
-      let ei := (cast_e cint ti) in
-      let ev := (cast_e (cword ws) te) in
-      (match eval_atype (jtype x) as c
-             return vars_ jident c -> cexec pwcmd  with
-       | carr n  => fun v =>
-                 ok (pwhile.assign v
-                  (app_ (app_ (app_
-                  (cst_ (fun (a : WArray.array n) (k : Z) (w : word ws) =>
-                   rdflt a (WArray.set a al aa k w))) (var_ v)) ei) ev))
-       | _ => fun _ => Error (typing_error ii)
-       end) (pwvar x)
-
-  | Lasub aa ws len x i =>
-      Let ti := toEC_e ii i in
-      let ei := (cast_e cint ti) in
-      let ev := (cast_e (carr (arr_size ws len)) te) in
-
-      (match eval_atype (jtype x) as c
-             return vars_ jident c -> cexec pwcmd with
-       | carr n  => fun v =>
-                     ok (pwhile.assign v
-                           (app_ (app_ (app_
-                                   (cst_ (fun (a : WArray.array n) (k : Z)
-                                   (b : WArray.array (arr_size ws len)) =>
-                              rdflt a (WArray.set_sub aa a k b))) (var_ v)) ei) ev))
-       | _ => fun _ => Error (typing_error ii)
-       end) (pwvar x)
-
-  | Lmem al ws _ a =>
-      Let ta := toEC_e ii a in
-      ok (pwhile.gassign memv
-            (app_ (app_ (app_
-                     (cst_ (fun (m : WArray.array mem_size) (p : word Uptr)
-                                (w : word ws) =>
-                              rdflt m (WArray.set m al AAdirect (wunsigned p) w)))
-                     (gvar_ memv))
-                     (cast_e (cword Uptr) ta))
-                  (cast_e (cword ws) te)))
+Definition to_word s (v:value) : (word s) :=
+  match v with
+  (* | Vword s' w => truncate_word s w *)
+  | _ => @witness (interp (cword s))
   end.
 
-Fixpoint toEC_lvs_seq (ii : instr_info) (lvs : lvals) (tes : seq texp) :
-    cexec pwcmd :=
-  match lvs, tes with
-  | [::], [::] => ok pwhile.skip
-  | lv :: lvs', te :: tes' =>
-      Let c1 := toEC_lv ii lv te in
-      Let c2 := toEC_lvs_seq ii lvs' tes' in
-      ok (pwhile.seqc c1 c2)
-  | _, _ => Error (arity_error ii)
+
+Definition of_val t : value -> (interp t) :=
+  match t return value -> (interp t) with
+  | cbool => to_bool
+  | cint => to_int
+  | carr n => to_arr n
+  | cword s => to_word s
   end.
 
-Fixpoint lvs_bindings (ii : instr_info) (lvs : lvals) (tes : seq texp) :
-    cexec (seq binding) :=
-  match lvs, tes with
-  | [::], [::] => ok [::]
-  | Lvar x :: lvs', te :: tes' =>
-      Let bs := lvs_bindings ii lvs' tes' in
-      ok (pw_bind x.(v_var) te :: bs)
-  | _ :: _, _ :: _ => Error (dest_error ii)
-  | _, _ => Error (arity_error ii)
-  end.
+Definition get_var wdb vm (x: var_i) : (interp (var_type x)):=
+  let v := vm.[x]%vm in
+  if (~~wdb || is_defined v) then
+   @witness (interp (var_type x)) else of_val (var_type x) v.
 
-Definition toEC_lvs (ii : instr_info) (lvs : lvals) (tes : seq texp) :
-    cexec pwcmd :=
-  if (size lvs <= 1)%nat then toEC_lvs_seq ii lvs tes
-  else Let bs := lvs_bindings ii lvs tes in ok (passign bs).
+Definition get_global gd (g: var_i) : (interp (var_type g)):=
+  if get_global_value gd g is Some ga then
+    let v := gv2val ga in
+    if type_of_val v == eval_atype (Var.vtype g) then of_val (var_type g) v
+    else @witness (interp (var_type g))
+  else @witness (interp (var_type g)).
 
-Definition rand_assign (ii : instr_info) (x : var) : cexec pwcmd :=
-  (match eval_atype (jtype x) as c
-     return vars_ jident c -> cexec pwcmd with
-   | carr n  => fun v => ok (pwhile.random v (cst_ (drandbytes n)))
-   | _ => fun _ => Error (syscall_error ii)
-   end) (pwvar x).
+Definition coremem_get (m : jstate) (x : gvar) : interp (var_type x.(gv)) :=
+  if is_lvar x then get_var wdb m.(evm) x.(gv)
+  else get_global gd x.(gv).
 
-(* -------------------------------------------------------------------- *)
-(* 5. Instructions                                                      *)
-(* -------------------------------------------------------------------- *)
+(* Definition coremem_set (m : jstate) (x : gvar) (v : interp T) := *)
+(*   CoreMem (mmain m) (hupd (mloc m) T x v). *)
 
-Definition call_cmd (fd : _ufundef) (fn : funname) (ii : instr_info)
-    (lvs : lvals) (tes : seq texp) : cexec pwcmd :=
-  Let bs :=
-    mapM2 (arity_error ii)
-      (fun (x : var_i) (te : texp) => ok (pw_bind x.(v_var) te))
-      fd.(f_params) tes
-  in
-  let res : seq texp :=
-    map (fun (x : var_i) =>
-           mk_texp (eval_atype (jtype x.(v_var))) (var_ (pwvar x.(v_var))))
-        fd.(f_res)
-  in
-  Let rs := lvs_bindings ii lvs res in
-  ok (pwhile.block bs (pwhile.call (pw_fun_id fn)) rs).
+(* Definition coremem_getg (m : coremem) (T : A) (x : ident) : interp T := *)
+(*   mmain m T x. *)
 
-Section CMD.
+(* Definition coremem_setg (m : coremem) (T : A) (x : ident) (v : interp T) := *)
+(*   CoreMem (hupd (mmain m) T x v) (mloc m). *)
 
-Context (toEC_i : instr -> cexec pwcmd).
+(* Definition coremem_new (m : coremem) := *)
+(*   CoreMem (mmain m) (fun (U : A) (_ : ident) => witness). *)
 
-Fixpoint toEC_c_aux (c : seq instr) : cexec pwcmd :=
-  match c with
-  | [::] => ok pwhile.skip
-  | i :: c' =>
-      Let d1 := toEC_i i in
-      Let d2 := toEC_c_aux c' in
-      ok (pwhile.seqc d1 d2)
-  end.
+(* Definition coremem_restore (m0 m : coremem) := CoreMem (mmain m) (mloc m0). *)
 
-End CMD.
+(* Lemma get_set_eq {T : A} (m : coremem) (x : ident) (v : interp T) : *)
+(*   (coremem_set m x v) T x = v. *)
+(* Proof. exact: hupd_eq. Qed. *)
 
-Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd :=
-  let: MkI ii ir := i in
-  match ir with
-  | Cassgn lv _ ty e =>
-      Let te := toEC_e ii e in
-      toEC_lv ii lv (mk_texp (eval_atype ty) (cast_e (eval_atype ty) te))
+(* Lemma set_get_eq {T : A} (m : coremem) (x : ident) : *)
+(*   coremem_set m x (coremem_get m T x) = m. *)
+(* Proof. *)
+(*  by case: m => m1 m2; *)
+(*    rewrite /mset /mget /mset_ /mget_ /= /coremem_set /=  hupd_id. *)
+(* Qed. *)
 
-  | Copn lvs _ o es =>
-      Let tes := toEC_es ii es in
-      let d := get_instr_desc o in
-      Let args := pwargs ii (map eval_atype d.(tin)) tes in
-      let outs :=
-        mapi (fun k t =>
-                mk_texp t
-                  (app_ (cst_ (fun vs =>
-                            nth_out t k (rdflt [::] (app_sopn_v d.(semi) vs))))
-                        args))
-             (map eval_atype d.(tout))
-      in
-      toEC_lvs ii lvs outs
+(* Lemma get_set_ne {T U : A} (m : coremem) (x y : ident) (v : interp T) : *)
+(*   (T <> U \/ x != y) -> (coremem_set m x v) U y = m U y. *)
+(* Proof. exact: hupd_ne. Qed. *)
 
-  | Csyscall lvs o es =>
-      match o, lvs with
-      | RandomBytes _ _, [:: Lvar x] => rand_assign ii x.(v_var)
-      | _, _ => Error (syscall_error ii)
-      end
+(* Lemma getg_setg_eq {T : A} (m : coremem) (x : ident) (v : interp T) : *)
+(*   coremem_getg (coremem_setg m x v) T x = v. *)
+(* Proof. exact: hupd_eq. Qed. *)
 
-  | Cassert a =>
-      Let b := toEC_assert ii a.2 in
-      ok (pwhile.cond b pwhile.skip pwhile.abort)
+(* Lemma getg_setg_ne {T U : A} (m : coremem) (x y : ident) (v : interp T) : *)
+(*   (T <> U \/ x != y) -> *)
+(*   coremem_getg (coremem_setg m x v) U y = coremem_getg m U y. *)
+(* Proof. exact: hupd_ne. Qed. *)
 
-  | Cif e c1 c2 =>
-      Let te := toEC_e ii e in
-      Let d1 := toEC_c_aux (toEC_i p) c1 in
-      Let d2 := toEC_c_aux (toEC_i p) c2 in
-      ok (pwhile.cond (cast_e cbool te) d1 d2)
+(* Lemma get_setg {T U : A} (m : coremem) (x y : ident) (v : interp T) : *)
+(*   (coremem_setg m x v) U y = m U y. *)
+(* Proof. by []. Qed. *)
 
-  | Cfor _ _ _ => Error (cfor_error ii)
+(* Lemma getg_set {T U : A} (m : coremem) (x y : ident) (v : interp T) : *)
+(*   coremem_getg (coremem_set m x v) U y = coremem_getg m U y. *)
+(* Proof. by []. Qed. *)
 
-  | Cwhile _ c1 e _ c2 =>
-      if c1 is [::] then
-        Let te := toEC_e ii e in
-        Let d2 := toEC_c_aux (toEC_i p) c2 in
-        ok (pwhile.while (cast_e cbool te) d2)
-      else Error (cwhile_error ii)
+(* Lemma get_new {U : A} (m : coremem) (y : ident) : *)
+(*   (coremem_new m) U y = witness. *)
+(* Proof. by []. Qed. *)
 
-  | Ccall lvs fn es =>
-      Let tes := toEC_es ii es in
-      match get_fundef (p_funcs p) fn with
-      | Some fd => call_cmd fd fn ii lvs tes
-      | None => Error (unknown_fun_error ii)
-      end
-  end.
+(* Lemma getg_new {U : A} (m : coremem) (y : ident) : *)
+(*   coremem_getg (coremem_new m) U y = coremem_getg m U y. *)
+(* Proof. by []. Qed. *)
 
-Definition toEC_c (p : _uprog) (c : seq instr) : cexec pwcmd :=
-  toEC_c_aux (toEC_i p) c.
+(* Lemma restore_id (m : coremem) : coremem_restore m m = m. *)
+(* Proof. by case: m. Qed. *)
 
-(* -------------------------------------------------------------------- *)
-(* 6. Programs                                                          *)
-(* -------------------------------------------------------------------- *)
+(* Lemma restoreA (m0 m1 m : coremem) : *)
+(*   coremem_restore m0 (coremem_restore m1 m) = coremem_restore m0 m. *)
+(* Proof. by []. Qed. *)
 
-Definition toEC_fd (p : _uprog) (fd : _ufundef) : cexec pwcmd :=
-  toEC_c p fd.(f_body).
+(* Lemma restore_new (m0 m : coremem) : *)
+(*   coremem_restore m0 (coremem_new m) = coremem_restore m0 m. *)
+(* Proof. by []. Qed. *)
 
-Definition toEC_fun_decl (p : _uprog) (fnd : funname * _ufundef) :
-    cexec (jident * pwcmd) :=
-  let: (fn, fd) := fnd in
-  Let c := toEC_fd p fd in
-  ok (pw_fun_id fn, c).
+(* Lemma restore_set {T : A} (m0 m : coremem) (x : ident) (v : interp T) : *)
+(*   coremem_restore m0 (coremem_set m x v) = coremem_restore m0 m. *)
+(* Proof. by []. Qed. *)
 
-Definition toEC_funcs (p : _uprog) : cexec (seq (jident * pwcmd)) :=
-  mapM (toEC_fun_decl p) (p_funcs p).
+(* Lemma restore_setg {T : A} (m0 m : coremem) (x : ident) (v : interp T) : *)
+(*   coremem_restore m0 (coremem_setg m x v) = coremem_setg (coremem_restore m0 m) x v. *)
+(* Proof. by []. Qed. *)
 
-Fixpoint pw_assoc (l : seq (jident * pwcmd)) (f : jident) : pwcmd :=
-  match l with
-  | [::] => pwhile.abort
-  | gc :: l' => if gc.1 == f then gc.2 else pw_assoc l' f
-  end.
+(* Lemma get_restore {d : A} (m0 m : coremem) (y : ident) : *)
+(*   (coremem_restore m0 m) d y = m0 d y. *)
+(* Proof. by []. Qed. *)
 
-Definition toEC_ps (p : _uprog) : cexec (jident -> pwcmd) :=
-  Let l := toEC_funcs p in ok (pw_assoc l).
+(* Lemma getg_restore {d : A} (m0 m : coremem) (y : ident) : *)
+(*   coremem_getg (coremem_restore m0 m) d y = coremem_getg m d y. *)
+(* Proof. by []. Qed. *)
 
-Definition toEC_glob (gd : glob_decl) : pwcmd :=
-  let: (x, g) := gd in
-  match g with
-  | Gword ws w =>
-      pwhile.gassign (pwvar x)
-        (coerce (cword ws) (eval_atype (jtype x)) (cst_ w))
-  | Garr len a =>
-      pwhile.gassign (pwvar x)
-        (coerce (carr len) (eval_atype (jtype x)) (cst_ a))
-  end.
+(* Lemma coremem_comparable : comparable coremem. *)
+(* Proof. by move=> m1 m2; apply/pselect. Qed. *)
 
-Definition toEC_globs (gd : glob_decls) : pwcmd :=
-  foldr (fun g c => pwhile.seqc (toEC_glob g) c) pwhile.skip gd.
+(* HB.instance Definition coremem_eqType := *)
+(*   hasDecEq.Build coremem (compareP coremem_comparable). *)
 
-End TOEC.
+(* HB.instance Definition coremem_choiceType := *)
+(*   gen_choiceMixin coremem. *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* HB.instance Definition coremem_memType := *)
+(*   isMemType.Build A ident coremem *)
+(*     (@get_set_eq) (@set_get_eq) (@get_set_ne) (@getg_setg_eq) (@getg_setg_ne) *)
+(*     (@get_setg) (@getg_set) (@getg_new) *)
+(*     restore_id restoreA restore_new (@restore_set) (@restore_setg) *)
+(*     (@get_restore) (@getg_restore). *)
+
+(* Definition cmem : memType A ident := coremem. *)
+
+End Mem.
+
+
+(* Section TOEC. *)
+(* Context {R: realType}. *)
+(* Context *)
+(*   {reg regx xreg rflag cond asm_op extra_op : Type} *)
+(*   {asm_e : asm_extra reg regx xreg rflag cond asm_op extra_op} *)
+(* . *)
+
+(* #[local] Existing Instance progUnit. *)
+
+(* Context (to_ident : var -> nat) (to_fname : funname -> nat). *)
+
+(* Definition pw_var_id (x : var)     : jident := (to_ident x).*2.+2. *)
+(* Definition pw_fun_id (f : funname) : jident := (to_fname f).*2.+3. *)
+(* Definition pw_mem_id               : jident := 0. *)
+
+(* Notation pexp T := (expr_ jcode jident (cmem jcode jident) T). *)
+(* Notation pwcmd  := (@cmd_ R jcode jident (cmem jcode jident) jident). *)
+
+(* Definition pwvar (x : var) : vars_ jident (eval_atype (jtype x)) := *)
+(*   pwhile.Var (eval_atype (jtype x)) (pw_var_id x). *)
+
+(* (* Jasmin's memory is one global array cell, [wbase Uptr] bytes wide. *)
+(*    Validity and alignment are replaced by [WArray]'s bounds -- the *)
+(*    "total denotations with defaults" convention -- but word access reuses *)
+(*    Jasmin's own [WArray.get]/[WArray.set] at [AAdirect] (scale 1). *) *)
+(* Definition mem_size : Z := wbase Uptr. *)
+
+(* Definition memv : vars_ jident (carr mem_size) := *)
+(*   pwhile.Var (carr mem_size) pw_mem_id. *)
+
+(* (* a translated expression, together with its Jasmin type *) *)
+(* Definition texp := { t : ctype & pexp (interp t) }. *)
+
+(* Definition mk_texp (t : ctype) (e : pexp (interp t)) : texp := existT _ t e. *)
+(* Arguments mk_texp : clear implicits. *)
+
+(* Definition texp_ty (te : texp) : ctype := projT1 te. *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* (* Coercion.  Rather than transporting along a [ctype] equality (which *)
+(*    would need an [eq_rect] at every operand), a coercion is *always* *)
+(*    applied, exactly as Jasmin's own [truncate_val = of_val . to_val]. *)
+(*    When the types already agree this is semantically the identity *)
+(*    ([of_val t (to_val x) = ok x]), so nothing is lost, and the definition *)
+(*    is total -- no [cexec], no dependent pattern matching. *) *)
+(* Definition coerce (tsrc tdst : ctype) (e : pexp (interp tsrc)) : pexp (interp tdst) := *)
+(*   app_ (cst_ (fun v => tot tdst (of_val tdst (jval tsrc v)))) e. *)
+(* Arguments coerce : clear implicits. *)
+
+(* Definition cast_e (tdst : ctype) (te : texp) : pexp (interp tdst) := *)
+(*   let: existT tsrc e := te in coerce tsrc tdst e. *)
+(* Arguments cast_e : clear implicits. *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* (* Operator arguments, as one [expr_] over [values]. *)
+
+(*    [expr_] *can* now be instantiated at [value]/[values] (it could not *)
+(*    under the old stack, which is why an auxiliary small sum type was *)
+(*    needed); it still cannot be instantiated at [exec _] or [sem_prod _ _], *)
+(*    so operators are applied through a value list with [app_sopn]/ *)
+(*    [app_sopn_v] inside a closure rather than by currying [sem_prod]. *) *)
+(* Fixpoint pwargs_aux (ts : seq ctype) (tes : seq texp) : pexp values := *)
+(*   match ts, tes with *)
+(*   | t :: ts', te :: tes' => *)
+(*       app_ (app_ (cst_ (@cons value)) (app_ (cst_ (jval t)) (cast_e t te))) *)
+(*            (pwargs_aux ts' tes') *)
+(*   | _, _ => cst_ [::] *)
+(*   end. *)
+
+(* Definition pwargs (ii : instr_info) (ts : seq ctype) (tes : seq texp) : *)
+(*     cexec (pexp values) := *)
+(*   if size ts == size tes then ok (pwargs_aux ts tes) *)
+(*   else Error (arity_error ii). *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* (* 3. Expressions                                                       *) *)
+(* (* -------------------------------------------------------------------- *) *)
+
+(* Definition pwgvar (x : gvar) : texp := *)
+(*   let xv := (gv x).(v_var) in *)
+(*   mk_texp (eval_atype (jtype xv)) *)
+(*     (if x.(gs) is Slocal then var_ (pwvar xv) else gvar_ (pwvar xv)). *)
+
+(* Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp := *)
+(*   match e with *)
+(*   | Pconst z => ok (mk_texp cint (cst_ z)) *)
+
+(*   | Pbool b => ok (mk_texp cbool (cst_ b)) *)
+
+(*   | Parr_init ws n => *)
+(*       ok (mk_texp (carr (arr_size ws n)) (cst_ (WArray.empty (arr_size ws n)))) *)
+
+(*   | Pvar x => ok (pwgvar x) *)
+
+(*   | Pget al aa ws x i => *)
+(*       Let ti := toEC_e ii i in *)
+(*       let ei := (cast_e cint ti) in *)
+(*       let: existT t e := (pwgvar x) in *)
+(*       (match t return pexp (interp t) -> cexec texp with *)
+(*        | carr n  => fun e => *)
+(*                      let e := *)
+(*                        app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) => *)
+(*                                            rdflt 0%R (WArray.get al aa ws a k))) e) ei *)
+(*                      in *)
+(*                      ok (mk_texp (cword ws) e) *)
+(*        | _   => fun _ => Error (typing_error ii) *)
+(*        end) e *)
+
+
+(*   | Psub aa ws len x i => *)
+(*       Let ti := toEC_e ii i in *)
+(*           let ei := (cast_e cint ti) in *)
+(*           let: existT t e := (pwgvar x) in *)
+(*           (match t return pexp (interp t) -> cexec texp with *)
+(*            | carr n  => fun e => *)
+(*                          let e := *)
+(*                          app_ (app_ (cst_ (fun (a : WArray.array n) (k : Z) => *)
+(*                                              rdflt (WArray.empty (arr_size ws len)) *)
+(*                                                (WArray.get_sub aa ws len a k))) e) ei *)
+(*                          in *)
+(*                          ok (mk_texp (carr (arr_size ws len)) e) *)
+(*            | _=> fun _ => Error (typing_error ii) *)
+(*            end) e *)
+
+(*   | Pload al ws a => *)
+(*       Let ta := toEC_e ii a in *)
+(*       ok (mk_texp (cword ws) *)
+(*             (app_ (app_ (cst_ (fun (m : WArray.array mem_size) (p : word Uptr) => *)
+(*                                  rdflt 0%R *)
+(*                                    (WArray.get al AAdirect ws m (wunsigned p)))) *)
+(*                      (gvar_ memv)) *)
+(*                   (cast_e (cword Uptr) ta))) *)
+
+(*   | Papp1 o e1 => *)
+(*       Let t1 := toEC_e ii e1 in *)
+(*       ok (mk_texp (eval_atype (type_of_op1 o).2) *)
+(*             (app_ (cst_ (fun v => *)
+(*                      tot (eval_atype (type_of_op1 o).2) *)
+(*                        (sem_sop1_typed o *)
+(*                           (of_interp (eval_atype (type_of_op1 o).1) v)))) *)
+(*                   (cast_e (eval_atype (type_of_op1 o).1) t1))) *)
+
+(*   | Papp2 o e1 e2 => *)
+(*       Let t1 := toEC_e ii e1 in *)
+(*       Let t2 := toEC_e ii e2 in *)
+(*       ok (mk_texp (eval_atype (type_of_op2 o).2) *)
+(*             (app_ (app_ (cst_ (fun v1 v2 => *)
+(*                        tot (eval_atype (type_of_op2 o).2) *)
+(*                          (sem_sop2_typed o *)
+(*                             (of_interp (eval_atype (type_of_op2 o).1.1) v1) *)
+(*                             (of_interp (eval_atype (type_of_op2 o).1.2) v2)))) *)
+(*                      (cast_e (eval_atype (type_of_op2 o).1.1) t1)) *)
+(*                   (cast_e (eval_atype (type_of_op2 o).1.2) t2))) *)
+
+(*   | PappN o es => *)
+(*       Let tes := mapM (toEC_e ii) es in *)
+(*       Let args := pwargs ii (map eval_atype (type_of_opN o).1) tes in *)
+(*       ok (mk_texp (eval_atype (type_of_opN o).2) *)
+(*             (app_ (cst_ (fun vs => *)
+(*                      tot (eval_atype (type_of_opN o).2) *)
+(*                        (app_sopn (map eval_atype (type_of_opN o).1) *)
+(*                           (sem_opN_typed o) vs))) *)
+(*                   args)) *)
+
+(*   | Pif ty b e1 e2 => *)
+(*       Let tb := toEC_e ii b in *)
+(*       Let t1 := toEC_e ii e1 in *)
+(*       Let t2 := toEC_e ii e2 in *)
+(*       ok (mk_texp (eval_atype ty) *)
+(*             (app_ (app_ (app_ *)
+(*                      (cst_ (fun (c : bool) (v1 v2 : interp (eval_atype ty)) => *)
+(*                               if c then v1 else v2)) *)
+(*                      (cast_e cbool tb)) *)
+(*                      (cast_e (eval_atype ty) t1)) *)
+(*                   (cast_e (eval_atype ty) t2))) *)
+(*   end. *)
+
+(* Definition toEC_es (ii : instr_info) (es : pexprs) : cexec (seq texp) := *)
+(*   mapM (toEC_e ii) es. *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* Fixpoint toEC_assert (ii : instr_info) (a : eassert) : cexec (pexp bool) := *)
+(*   match a with *)
+(*   | Pexpr e => *)
+(*       Let te := toEC_e ii e in *)
+(*       ok (cast_e cbool te) *)
+
+(*   | PappN_safety o es => *)
+(*       Let tes := toEC_es ii es in *)
+(*       Let args := pwargs ii (map eval_atype (type_of_opN_safety o).1) tes in *)
+(*       ok (app_ (cst_ (fun vs => rdflt false (sem_opN_safety o vs))) args) *)
+
+(*   | Pis_var_init _ => ok (cst_ true) *)
+
+(*   | Pis_mem_init _ _ => ok (cst_ true) *)
+
+(*   | Pand a1 a2 => *)
+(*       Let b1 := toEC_assert ii a1 in *)
+(*       Let b2 := toEC_assert ii a2 in *)
+(*       ok (app_ (app_ (cst_ andb) b1) b2) *)
+(*   end. *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* (* 4. Left-hand sides                                                   *) *)
+(* (* -------------------------------------------------------------------- *) *)
+
+(* (* Parallel assignment.  [block bs skip rs] evaluates [bs] in the *outer* *)
+(*    memory into a frame that [minit]'s [mnew] has just wiped, then [mret] *)
+(*    restores the outer locals and evaluates [rs] in that frame.  Reading *)
+(*    each bound variable straight back therefore performs a simultaneous *)
+(*    assignment -- with no auxiliary names to invent, and without *)
+(*    re-evaluating right-hand sides that a destination may clobber *)
+(*    ([normalize_calls] does not make destinations disjoint from the *)
+(*    arguments' reads). *) *)
+(* Definition pw_bind (x : var) (te : texp) : binding := *)
+(*   bind_of (pwvar x) (cast_e (eval_atype (jtype x)) te). *)
+
+(* Definition passign (bs : seq binding) : pwcmd := *)
+(*   pwhile.block bs pwhile.skip *)
+(*     (map (fun b => let: existT _ (x, _) := b in bind_of x (var_ x)) bs). *)
+
+(* Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd := *)
+(*   match lv with *)
+(*   | Lnone _ _ => ok pwhile.skip *)
+
+(*   | Lvar x => *)
+(*       ok (pwhile.assign (pwvar x.(v_var)) *)
+(*             (cast_e (eval_atype (jtype x.(v_var))) te)) *)
+
+(*   | Laset al aa ws x i => *)
+(*       Let ti := toEC_e ii i in *)
+(*       let ei := (cast_e cint ti) in *)
+(*       let ev := (cast_e (cword ws) te) in *)
+(*       (match eval_atype (jtype x) as c *)
+(*              return vars_ jident c -> cexec pwcmd  with *)
+(*        | carr n  => fun v => *)
+(*                  ok (pwhile.assign v *)
+(*                   (app_ (app_ (app_ *)
+(*                   (cst_ (fun (a : WArray.array n) (k : Z) (w : word ws) => *)
+(*                    rdflt a (WArray.set a al aa k w))) (var_ v)) ei) ev)) *)
+(*        | _ => fun _ => Error (typing_error ii) *)
+(*        end) (pwvar x) *)
+
+(*   | Lasub aa ws len x i => *)
+(*       Let ti := toEC_e ii i in *)
+(*       let ei := (cast_e cint ti) in *)
+(*       let ev := (cast_e (carr (arr_size ws len)) te) in *)
+
+(*       (match eval_atype (jtype x) as c *)
+(*              return vars_ jident c -> cexec pwcmd with *)
+(*        | carr n  => fun v => *)
+(*                      ok (pwhile.assign v *)
+(*                            (app_ (app_ (app_ *)
+(*                                    (cst_ (fun (a : WArray.array n) (k : Z) *)
+(*                                    (b : WArray.array (arr_size ws len)) => *)
+(*                               rdflt a (WArray.set_sub aa a k b))) (var_ v)) ei) ev)) *)
+(*        | _ => fun _ => Error (typing_error ii) *)
+(*        end) (pwvar x) *)
+
+(*   | Lmem al ws _ a => *)
+(*       Let ta := toEC_e ii a in *)
+(*       ok (pwhile.gassign memv *)
+(*             (app_ (app_ (app_ *)
+(*                      (cst_ (fun (m : WArray.array mem_size) (p : word Uptr) *)
+(*                                 (w : word ws) => *)
+(*                               rdflt m (WArray.set m al AAdirect (wunsigned p) w))) *)
+(*                      (gvar_ memv)) *)
+(*                      (cast_e (cword Uptr) ta)) *)
+(*                   (cast_e (cword ws) te))) *)
+(*   end. *)
+
+(* Fixpoint toEC_lvs_seq (ii : instr_info) (lvs : lvals) (tes : seq texp) : *)
+(*     cexec pwcmd := *)
+(*   match lvs, tes with *)
+(*   | [::], [::] => ok pwhile.skip *)
+(*   | lv :: lvs', te :: tes' => *)
+(*       Let c1 := toEC_lv ii lv te in *)
+(*       Let c2 := toEC_lvs_seq ii lvs' tes' in *)
+(*       ok (pwhile.seqc c1 c2) *)
+(*   | _, _ => Error (arity_error ii) *)
+(*   end. *)
+
+(* Fixpoint lvs_bindings (ii : instr_info) (lvs : lvals) (tes : seq texp) : *)
+(*     cexec (seq binding) := *)
+(*   match lvs, tes with *)
+(*   | [::], [::] => ok [::] *)
+(*   | Lvar x :: lvs', te :: tes' => *)
+(*       Let bs := lvs_bindings ii lvs' tes' in *)
+(*       ok (pw_bind x.(v_var) te :: bs) *)
+(*   | _ :: _, _ :: _ => Error (dest_error ii) *)
+(*   | _, _ => Error (arity_error ii) *)
+(*   end. *)
+
+(* Definition toEC_lvs (ii : instr_info) (lvs : lvals) (tes : seq texp) : *)
+(*     cexec pwcmd := *)
+(*   if (size lvs <= 1)%nat then toEC_lvs_seq ii lvs tes *)
+(*   else Let bs := lvs_bindings ii lvs tes in ok (passign bs). *)
+
+(* Definition rand_assign (ii : instr_info) (x : var) : cexec pwcmd := *)
+(*   (match eval_atype (jtype x) as c *)
+(*      return vars_ jident c -> cexec pwcmd with *)
+(*    | carr n  => fun v => ok (pwhile.random v (cst_ (drandbytes n))) *)
+(*    | _ => fun _ => Error (syscall_error ii) *)
+(*    end) (pwvar x). *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* (* 5. Instructions                                                      *) *)
+(* (* -------------------------------------------------------------------- *) *)
+
+(* Definition call_cmd (fd : _ufundef) (fn : funname) (ii : instr_info) *)
+(*     (lvs : lvals) (tes : seq texp) : cexec pwcmd := *)
+(*   Let bs := *)
+(*     mapM2 (arity_error ii) *)
+(*       (fun (x : var_i) (te : texp) => ok (pw_bind x.(v_var) te)) *)
+(*       fd.(f_params) tes *)
+(*   in *)
+(*   let res : seq texp := *)
+(*     map (fun (x : var_i) => *)
+(*            mk_texp (eval_atype (jtype x.(v_var))) (var_ (pwvar x.(v_var)))) *)
+(*         fd.(f_res) *)
+(*   in *)
+(*   Let rs := lvs_bindings ii lvs res in *)
+(*   ok (pwhile.block bs (pwhile.call (pw_fun_id fn)) rs). *)
+
+(* Section CMD. *)
+
+(* Context (toEC_i : instr -> cexec pwcmd). *)
+
+(* Fixpoint toEC_c_aux (c : seq instr) : cexec pwcmd := *)
+(*   match c with *)
+(*   | [::] => ok pwhile.skip *)
+(*   | i :: c' => *)
+(*       Let d1 := toEC_i i in *)
+(*       Let d2 := toEC_c_aux c' in *)
+(*       ok (pwhile.seqc d1 d2) *)
+(*   end. *)
+
+(* End CMD. *)
+
+(* Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd := *)
+(*   let: MkI ii ir := i in *)
+(*   match ir with *)
+(*   | Cassgn lv _ ty e => *)
+(*       Let te := toEC_e ii e in *)
+(*       toEC_lv ii lv (mk_texp (eval_atype ty) (cast_e (eval_atype ty) te)) *)
+
+(*   | Copn lvs _ o es => *)
+(*       Let tes := toEC_es ii es in *)
+(*       let d := get_instr_desc o in *)
+(*       Let args := pwargs ii (map eval_atype d.(tin)) tes in *)
+(*       let outs := *)
+(*         mapi (fun k t => *)
+(*                 mk_texp t *)
+(*                   (app_ (cst_ (fun vs => *)
+(*                             nth_out t k (rdflt [::] (app_sopn_v d.(semi) vs)))) *)
+(*                         args)) *)
+(*              (map eval_atype d.(tout)) *)
+(*       in *)
+(*       toEC_lvs ii lvs outs *)
+
+(*   | Csyscall lvs o es => *)
+(*       match o, lvs with *)
+(*       | RandomBytes _ _, [:: Lvar x] => rand_assign ii x.(v_var) *)
+(*       | _, _ => Error (syscall_error ii) *)
+(*       end *)
+
+(*   | Cassert a => *)
+(*       Let b := toEC_assert ii a.2 in *)
+(*       ok (pwhile.cond b pwhile.skip pwhile.abort) *)
+
+(*   | Cif e c1 c2 => *)
+(*       Let te := toEC_e ii e in *)
+(*       Let d1 := toEC_c_aux (toEC_i p) c1 in *)
+(*       Let d2 := toEC_c_aux (toEC_i p) c2 in *)
+(*       ok (pwhile.cond (cast_e cbool te) d1 d2) *)
+
+(*   | Cfor _ _ _ => Error (cfor_error ii) *)
+
+(*   | Cwhile _ c1 e _ c2 => *)
+(*       if c1 is [::] then *)
+(*         Let te := toEC_e ii e in *)
+(*         Let d2 := toEC_c_aux (toEC_i p) c2 in *)
+(*         ok (pwhile.while (cast_e cbool te) d2) *)
+(*       else Error (cwhile_error ii) *)
+
+(*   | Ccall lvs fn es => *)
+(*       Let tes := toEC_es ii es in *)
+(*       match get_fundef (p_funcs p) fn with *)
+(*       | Some fd => call_cmd fd fn ii lvs tes *)
+(*       | None => Error (unknown_fun_error ii) *)
+(*       end *)
+(*   end. *)
+
+(* Definition toEC_c (p : _uprog) (c : seq instr) : cexec pwcmd := *)
+(*   toEC_c_aux (toEC_i p) c. *)
+
+(* (* -------------------------------------------------------------------- *) *)
+(* (* 6. Programs                                                          *) *)
+(* (* -------------------------------------------------------------------- *) *)
+
+(* Definition toEC_fd (p : _uprog) (fd : _ufundef) : cexec pwcmd := *)
+(*   toEC_c p fd.(f_body). *)
+
+(* Definition toEC_fun_decl (p : _uprog) (fnd : funname * _ufundef) : *)
+(*     cexec (jident * pwcmd) := *)
+(*   let: (fn, fd) := fnd in *)
+(*   Let c := toEC_fd p fd in *)
+(*   ok (pw_fun_id fn, c). *)
+
+(* Definition toEC_funcs (p : _uprog) : cexec (seq (jident * pwcmd)) := *)
+(*   mapM (toEC_fun_decl p) (p_funcs p). *)
+
+(* Fixpoint pw_assoc (l : seq (jident * pwcmd)) (f : jident) : pwcmd := *)
+(*   match l with *)
+(*   | [::] => pwhile.abort *)
+(*   | gc :: l' => if gc.1 == f then gc.2 else pw_assoc l' f *)
+(*   end. *)
+
+(* Definition toEC_ps (p : _uprog) : cexec (jident -> pwcmd) := *)
+(*   Let l := toEC_funcs p in ok (pw_assoc l). *)
+
+(* Definition toEC_glob (gd : glob_decl) : pwcmd := *)
+(*   let: (x, g) := gd in *)
+(*   match g with *)
+(*   | Gword ws w => *)
+(*       pwhile.gassign (pwvar x) *)
+(*         (coerce (cword ws) (eval_atype (jtype x)) (cst_ w)) *)
+(*   | Garr len a => *)
+(*       pwhile.gassign (pwvar x) *)
+(*         (coerce (carr len) (eval_atype (jtype x)) (cst_ a)) *)
+(*   end. *)
+
+(* Definition toEC_globs (gd : glob_decls) : pwcmd := *)
+(*   foldr (fun g c => pwhile.seqc (toEC_glob g) c) pwhile.skip gd. *)
+
+(* End TOEC. *)
