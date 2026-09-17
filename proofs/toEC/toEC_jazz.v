@@ -1,4 +1,5 @@
 Require Import compiler_util expr arch_decl arch_extra.
+Require Import sem_type sem_params.
 Require Import normalize_cond.
 Require Import refresh_for.
 Require Import init_local_arrays.
@@ -10,10 +11,12 @@ Require Import make_coercions_explicit.
 Require Import remove_nullary_opns.
 Require Import legalize_names.
 Require Import toEC.
-(* [toEC] fixes the code alphabet ([jcode = ctype]) and the identifier
-   type ([jident = nat]); [pwhile_new] is needed here only to name
-   [cmd_]/[cmem] in the signatures below. *)
-From xhl.pwhile Require Import inhabited_new pwhile_new.
+(* [toEC] fixes both code alphabets ([jcode = ctype] for locals,
+   [jgcode] for the single memory slot) and both identifier types
+   ([jident = var], [jidentg = unit]); [pwhile] is needed here only to
+   name [cmd_] in the signatures below. *)
+From xhl.pwhile Require Import inhabited pwhile.
+From mathcomp.reals Require Import reals.
 
 Section TOEC.
 
@@ -46,22 +49,21 @@ Definition toEC_prog (normal : bool) (p : _uprog) : cexec _uprog :=
    without an extracted module.  Pre-existing, and out of scope here. *)
 Section TO_PWHILE.
 
-Context
-  (to_ident : var -> nat)
-  (to_fname : funname -> nat)
-.
+(* [R] has to be named rather than inferred: it occurs only in the result
+   type of [toEC_ps] (a [cmd_ R ...]), never in its arguments.  [wsw] and
+   [wa] are classes, so instance resolution finds them. *)
+Context {R : realType} {wsw : WithSubWord} {wa : WithAssert}.
 
-(* return types left to inference: the section-local [pwcmd] notation of
-   [toEC.v] is not in scope here, and spelling [cmd_ jcode jident ...] out
-   would need the [nat -> eqType] coercion in an annotation position. *)
+(* return type left to inference: the section-local [pwcmd] notation of
+   [toEC.v] is not in scope here. *)
 Definition toEC_pwhile (normal : bool) (p : _uprog) :=
   Let p' := toEC_prog normal p in
-  toEC_ps to_ident to_fname p'.
+  toEC_ps (R:=R) p'.
 
-(* The global constants of [p] as an initialisation command, to be run
-   before the entry point: [toEC_ps] translates function bodies only. *)
-Definition toEC_pwhile_globs (p : _uprog) :=
-  toEC_globs to_ident p.(p_globs).
+(* There is no global-initialisation counterpart any more: the pwhile
+   global store holds nothing but Jasmin's memory, so [toEC.v] has no
+   [toEC_globs] and a program with global variables is rejected outright
+   by [pwgvar]. *)
 
 End TO_PWHILE.
 

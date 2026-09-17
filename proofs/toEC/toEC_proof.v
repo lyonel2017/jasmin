@@ -45,13 +45,13 @@ Require Import arch_decl arch_extra sem_params_of_arch_extra.
 Require Import memory_model low_memory.
 Require Export toEC.
 
-(* [psemantic_new] is deliberately *not* imported: its memory notations
+(* [psemantic] is deliberately *not* imported: its memory notations
    [_ .[ _ ]] / [_ .[ _ <- _ ]] are declared at argument levels
    incompatible with Jasmin's homonyms in [varmap.v], which is a hard
-   error rather than an overridable warning.  [itree_new] only [Require]s
+   error rather than an overridable warning.  [itree] only [Require]s
    it, so nothing leaks; the one thing needed from it is named qualified. *)
-From xhl.pwhile Require Import inhabited_new pwhile_new itree_new.
-From xhl.pwhile Require psemantic_new.
+From xhl.pwhile Require Import inhabited mem pwhile itree.
+From xhl.pwhile Require psemantic.
 
 Import Utf8.
 
@@ -80,56 +80,57 @@ Context
 #[local] Existing Instance ep_of_asm_e.
 #[local] Existing Instance sip_of_asm_e.
 
-Context
-  (to_ident : var -> nat)
-  (to_fname : funname -> nat)
-.
+(* [R] is needed because [pwcmd] is a [cmd_ R ...]; [wa] because
+   [toEC_ps] rejects [Cassert] under [noassert]. *)
+Context {R : realType} {wa : WithAssert}.
 
-Notation pwcmd := (cmd_ jcode jident (cmem jcode jident) jident).
-Notation pwmem := (cmem jcode jident).
+Notation pwcmd := (cmd_ R jcode jgcode jident jidentg jmem funname).
+(* the carrier, not the packed [jmem]: [mget] / [mgetg] find the memType
+   on [jstate] by canonical structure resolution. *)
+Notation pwmem := jstate.
 
-(* [Rnd] is indexed by the code alphabet; pin it to Jasmin.s. *)
-Notation jRnd := (@Rnd jcode) (only parsing).
+(* [Rnd] is indexed by the real type and the *local* code alphabet
+   ([random] assigns to a local variable); pin both. *)
+Notation jRnd := (@Rnd R jcode) (only parsing).
 
-(* the pwhile variable / function / memory slots of [toEC.v] *)
-Notation pvid x := (pw_var_id to_ident x) (only parsing).
-Notation pfid f := (pw_fun_id to_fname f) (only parsing).
+(* No identifier maps any more: a Jasmin variable *is* a pwhile local
+   identifier and a [funname] *is* a pwhile function name, so [pw_var_id]
+   and [pw_fun_id] are gone.
 
-(* reading a Jasmin variable back out of a pwhile memory, as a [value].
-   Note there is no conversion any more: [interp t] *is* the carrier, so
-   this is just [to_val] after the store lookup. *)
+   Reading a Jasmin variable back out of a pwhile memory, as a [value]:
+   there is no conversion beyond [jval], since [interp t] is the carrier. *)
 Definition read_jvar (cm : pwmem) (x : var) : value :=
-  jval (eval_atype (jtype x)) (mget (eval_atype (jtype x)) cm (pvid x)).
+  jval (eval_atype (jtype x)) (mget (eval_atype (jtype x)) cm x).
 
-Definition read_jglob (cm : pwmem) (x : var) : value :=
-  jval (eval_atype (jtype x)) (mgetg (eval_atype (jtype x)) cm (pvid x)).
+(* There is no [read_jglob]: the global store holds nothing but Jasmin's
+   memory, and a program with global variables is rejected by [pwgvar]. *)
 
 (* ==================================================================== *)
 (* 1. Matching relations                                                *)
 (* ==================================================================== *)
 
-(* pwhile's *local* store agrees with the Jasmin varmap, through
-   [pw_var_id] and the code alphabet. *)
+(* [toEC.v]'s [jstate] has fields named [emem] and [evm] too -- after
+   [Require Export toEC] those shadow Jasmin's [estate] projections, so
+   the Jasmin ones are qualified below. *)
+Notation jsvm s := (psem_defs.evm s) (only parsing).
+Notation jsmem s := (psem_defs.emem s) (only parsing).
+
+(* pwhile's *local* store agrees with the Jasmin varmap, through the
+   retyped key of [toEC.v] and the code alphabet. *)
 Definition match_vm (vm : Vm.t) (cm : pwmem) : Prop :=
   forall x : var, value_uincl (Vm.get vm x) (read_jvar cm x).
 
-(* pwhile's *global* store holds Jasmin's memory, in the single cell
-   [pw_mem_id], as one [WArray.array mem_size].  Only the addresses Jasmin
-   can actually read are constrained -- that is the point of modelling
-   memory by a total byte store. *)
+(* pwhile's *global* store is Jasmin's memory and nothing else: the global
+   alphabet has a single code whose interpretation *is* [mem], held at the
+   single identifier [tt].  So this is an equality, not the byte-wise
+   containment the old [WArray mem_size] encoding needed. *)
 Definition match_mem (m : Memory.mem) (cm : pwmem) : Prop :=
-  forall (a : pointer) (w : u8),
-    read m Aligned a U8 = ok w ->
-    WArray.get8 (mgetg (carr (mem_size (asm_e := asm_e))) cm pw_mem_id)
-                (wunsigned a) = ok w.
+  mgetg (@Gmem _) cm tt = m.
 
-(* ... and it holds the global constants, which [toEC_globs] installs. *)
-Definition match_globs (gd : glob_decls) (cm : pwmem) : Prop :=
-  forall (x : var) (g : glob_value),
-    assoc gd x = Some g -> value_uincl (gv2val g) (read_jglob cm x).
-
-Definition match_estate (p : _uprog) (s : estate) (cm : pwmem) : Prop :=
-  [/\ match_vm s.(evm) cm, match_mem s.(emem) cm & match_globs (p_globs p) cm ].
+(* There is no [match_globs]: [toEC.v] has no [toEC_globs] and no global
+   variables to install. *)
+Definition match_estate (s : estate) (cm : pwmem) : Prop :=
+  match_vm (jsvm s) cm /\ match_mem (jsmem s) cm.
 
 (* On entry to [fn], [cm] must already hold the arguments in the callee's
    own parameter slots -- which is exactly what pwhile's [minit] does at a
@@ -149,17 +150,11 @@ Definition match_res (fd : _ufundef) (vs : values) (cm : pwmem) : Prop :=
 (* [fstate]'s [fscs] (the syscall oracle state) has no pwhile counterpart:
    pwhile models [RandomBytes] as a genuine distribution rather than as an
    oracle, so nothing constrains it here.  See [randombytes_model]. *)
-Definition match_fstate (p : _uprog) (fd : _ufundef) (fs : fstate) (cm : pwmem)
-  : Prop :=
-  [/\ match_params fd fs.(fvals) cm
-    , match_mem fs.(fmem) cm
-    & match_globs (p_globs p) cm ].
+Definition match_fstate (fd : _ufundef) (fs : fstate) (cm : pwmem) : Prop :=
+  match_params fd fs.(fvals) cm /\ match_mem fs.(fmem) cm.
 
-Definition match_fstate_out (p : _uprog) (fd : _ufundef) (fr : fstate)
-    (cm : pwmem) : Prop :=
-  [/\ match_res fd fr.(fvals) cm
-    , match_mem fr.(fmem) cm
-    & match_globs (p_globs p) cm ].
+Definition match_fstate_out (fd : _ufundef) (fr : fstate) (cm : pwmem) : Prop :=
+  match_res fd fr.(fvals) cm /\ match_mem fr.(fmem) cm.
 
 (* ==================================================================== *)
 (* 2. Event relations                                                   *)
@@ -201,7 +196,7 @@ Definition randombytes_model : Prop :=
          (a a' : WArray.array (arr_size ws n)),
     exec_syscall st m (RandomBytes ws n) [:: Varr a]
       = ok (st', m', [:: Varr a']) ->
-    drandbytes (arr_size ws n) a' <> 0%R.
+    drandbytes (R:=R) (arr_size ws n) a' <> 0%R.
 
 (* ==================================================================== *)
 (* 3. The theorem                                                       *)
@@ -210,36 +205,32 @@ Definition randombytes_model : Prop :=
 Context
   (p : _uprog)
   (ev : extra_val_t)
-  (ps : jident -> pwcmd)
-  (toEC_ok : toEC_ps to_ident to_fname p = ok ps)
+  (ps : funname -> pwcmd)
+  (toEC_ok : toEC_ps (R:=R) p = ok ps)
 .
 
 Theorem toEC_psP fn fd fs cm :
   get_fundef (p_funcs p) fn = Some fd ->
-  match_fstate p fd fs cm ->
+  match_fstate fd fs cm ->
   xrutt (errcutoff (is_error wE)) nocutoff no_pre no_post
-    (match_fstate_out p fd)
+    (match_fstate_out fd)
     (isem_fun p ev fn fs)
     (interp_call (E := jRnd) ps
-       (com_sem (E := jRnd) (pwhile_new.call (pfid fn)) cm)).
+       (com_sem (E := jRnd) (pwhile.call fn) cm)).
 Proof. Admitted.
 
 (* -------------------------------------------------------------------- *)
 (* The same statement at the level of sub-distributions comes for free
-   from xhl: [interp_fullE] (itree_new.v:685) identifies [interp_full]
-   with [psemantic_new.ssem_], so there is no need to name the
-   distribution semantics here at all.
-
-   ([range] is deliberately avoided: it lives in [pwhile/range.v], which
-   is still bound to the *old* [pwhile.v], and requiring it would drag
-   that stack in alongside this one.) *)
+   from xhl: [interp_fullE] (itree.v:685) identifies [interp_full] with
+   [psemantic.ssem_], so there is no need to name the distribution
+   semantics here at all. *)
 Corollary toEC_ps_interp_fullP fn fd fs cm :
   get_fundef (p_funcs p) fn = Some fd ->
-  match_fstate p fd fs cm ->
+  match_fstate fd fs cm ->
   exists fr cm',
     [/\ isem_fun p ev fn fs ≈ Ret fr
-      , match_fstate_out p fd fr cm'
-      & interp_full (pwhile_new.call (pfid fn)) ps cm = dunit cm' ].
+      , match_fstate_out fd fr cm'
+      & interp_full (pwhile.call fn) ps cm = dunit cm' ].
 Proof. Admitted.
 
 End TOEC_PROOF.

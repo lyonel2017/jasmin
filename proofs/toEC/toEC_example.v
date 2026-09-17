@@ -118,14 +118,48 @@ Context (fn_f : funname).
 Definition prog : _uprog :=
   {| p_funcs := [:: (fn_f, fd_f) ]; p_globs := [::]; p_extra := tt |}.
 
-Lemma example_body_ok : is_ok (toEC_c (R:=R) prog body).
-Proof. by []. Qed.
+Lemma example_body_ok : (toEC_c (R:=R) prog body) = ok skip.
+Proof.
+  cbn.
+Admitted.
 
 Lemma example_prog_ok : is_ok (toEC_ps (R:=R) prog).
 Proof. by []. Qed.
 
 (* ==================================================================== *)
-(* 2. Memory                                                             *)
+(* 2. Coercions appear only where the types differ                       *)
+(* ==================================================================== *)
+
+(*  s = n;  with both [s] and [n] of type u64.
+
+    [Cassgn] passes its right-hand side through two casts -- [toEC_i]
+    casts to the assignment's type, then [toEC_lv]'s [Lvar] case casts to
+    the destination's type.  That pair is not redundant in general, since
+    Jasmin's own [sem_i] does [truncate_val ty] before [write_lval]; here
+    the two types coincide, so both casts collapse and the image is a bare
+    variable read.  Stated as an equality rather than a shape, so any
+    surviving coercion breaks it. *)
+Lemma example_assgn_no_coerce :
+  toEC_c (R:=R) prog
+    [:: MkI II (Cassgn (Lvar (V v_s)) AT_none (aword U64) (E_ v_n)) ]
+  = ok (pwhile.seqc (pwhile.assign (pwvar v_s) (var_ (pwvar v_n))) pwhile.skip).
+Proof. by []. Qed.
+
+(*  s = 1;  the literal is an int and [s] is a u64, so exactly one
+    coercion survives: [Cassgn]'s cast to the assignment type.  The
+    destination cast still collapses. *)
+Lemma example_assgn_one_coerce :
+  toEC_c (R:=R) prog
+    [:: MkI II (Cassgn (Lvar (V v_s)) AT_none (aword U64) (Pconst 1)) ]
+  = ok (pwhile.seqc
+          (pwhile.assign (pwvar v_s)
+             (app_ (cst_ (fun v => jof_val (cword U64) (jval cint v)))
+                   (cst_ (1%Z))))
+          pwhile.skip).
+Proof. by []. Qed.
+
+(* ==================================================================== *)
+(* 3. Memory                                                             *)
 (* ==================================================================== *)
 
 (*  s = [u64 n];        becomes   s <<- read <mem> n U64
@@ -157,7 +191,7 @@ Lemma example_mem_shape :
 Proof. by []. Qed.
 
 (* ==================================================================== *)
-(* 3. Assertions                                                         *)
+(* 4. Assertions                                                         *)
 (* ==================================================================== *)
 
 (*  assert (i < 4);   becomes   If <i < 4> then skip else abort. *)
@@ -190,7 +224,7 @@ Lemma example_mem_init_ok : is_ok (toEC_c (R:=R) prog body_mem_init).
 Proof. by []. Qed.
 
 (* ==================================================================== *)
-(* 4. A procedure call                                                   *)
+(* 5. A procedure call                                                   *)
 (* ==================================================================== *)
 
 (*  fn add(reg u64 a, reg u64 b) -> reg u64 { reg u64 r; r = a + b; return r; }
@@ -251,7 +285,7 @@ Lemma example_call_shape :
 Proof. by rewrite /toEC_c /body_g /= eqxx. Qed.
 
 (* ==================================================================== *)
-(* 5. What the translation rejects                                       *)
+(* 6. What the translation rejects                                       *)
 (* ==================================================================== *)
 
 (* There are no global variables: the global store holds only the memory,

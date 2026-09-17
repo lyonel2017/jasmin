@@ -506,19 +506,48 @@ Arguments mk_texp : clear implicits.
 Definition texp_ty (te : texp) : ctype := projT1 te.
 
 (* -------------------------------------------------------------------- *)
-(* Coercion.  Rather than transporting along a [ctype] equality (which
-   would need an [eq_rect] at every operand), a coercion is *always*
-   applied, exactly as Jasmin's own [truncate_val = of_val . to_val].
-   When the types already agree this is semantically the identity
-   ([jof_val_jval]), so nothing is lost, and the definition is total --
-   no [cexec], no dependent pattern matching. *)
+(* Coercion, emitted only when the types really differ.  When they agree
+   the expression is returned untouched, which is sound because
+   [jof_val t (jval t v) = v] ([jof_val_jval] above) -- so the wrapper it
+   replaces denoted the identity anyway.  Otherwise the coercion is
+   exactly Jasmin's own [truncate_val = of_val . to_val], total: no
+   [cexec] and no failure case.
+
+   [arch_extra.ctype_eq_dec] is used rather than [type_eq_dec]
+   (xhl/inhabited.v).  The latter goes through [ctype_eqb_OK], which
+   elpi's [derive] closes with [Qed], so it does not reduce: [vm_compute]
+   leaves [type_eq_dec cint cint] stuck on it, and the [ecast] below would
+   survive as residue instead of vanishing.  [ctype_eq_dec] is hand-written
+   and [Defined] precisely so that it reduces to [left erefl] on concrete
+   arguments -- see the comment at arch_extra.v. *)
 Definition coerce (tsrc tdst : ctype) (e : pexp (interp tsrc)) : pexp (interp tdst) :=
-  app_ (cst_ (fun v => jof_val tdst (jval tsrc v))) e.
+  match ctype_eq_dec tsrc tdst with
+  | left h  => ecast t (pexp (interp t)) h e
+  | right _ => app_ (cst_ (fun v => jof_val tdst (jval tsrc v))) e
+  end.
 Arguments coerce : clear implicits.
 
 Definition cast_e (tdst : ctype) (te : texp) : pexp (interp tdst) :=
   let: existT tsrc e := te in coerce tsrc tdst e.
 Arguments cast_e : clear implicits.
+
+(* [coerce_id] and [coerce_neq] characterise [coerce] completely.  The
+   first also covers what conversion cannot: an *abstract* [t], where
+   [ctype_eq_dec t t] is stuck.  [eq_irrelevance] applies since [ctype] is
+   an eqType. *)
+Lemma coerce_id (t : ctype) (e : pexp (interp t)) : coerce t t e = e.
+Proof.
+rewrite /coerce; case: (ctype_eq_dec t t) => [h|ne]; last by case: ne.
+by rewrite (eq_irrelevance h (erefl t)).
+Qed.
+
+Lemma coerce_neq (tsrc tdst : ctype) (e : pexp (interp tsrc)) :
+  tsrc <> tdst ->
+  coerce tsrc tdst e = app_ (cst_ (fun v => jof_val tdst (jval tsrc v))) e.
+Proof. by rewrite /coerce; case: ctype_eq_dec. Qed.
+
+Lemma cast_e_id (t : ctype) (e : pexp (interp t)) : cast_e t (mk_texp t e) = e.
+Proof. exact: coerce_id. Qed.
 
 (* -------------------------------------------------------------------- *)
 (* Operator arguments, as one [expr_] over [values].
@@ -835,10 +864,6 @@ Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd :=
       Let te := toEC_e ii e in
       toEC_lv ii lv (mk_texp (eval_atype ty) (cast_e (eval_atype ty) te))
 
-  (* Each output re-evaluates [args]; [app_sopn_v] is pure, so this is
-     duplicated work and syntax, not a semantic difference.  Binding the
-     result list once would need an auxiliary variable, and
-     [Ident.ident] is abstract -- no fresh name can be fabricated. *)
   | Copn lvs _ o es =>
       Let tes := toEC_es ii es in
       let d := get_instr_desc o in
@@ -859,9 +884,6 @@ Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd :=
       | _, _ => Error (syscall_error ii)
       end
 
-  (* [sem_assert] begins with [assert assert_allowed ErrType], so under
-     [noassert] a [Cassert] has no successful run at all.  Such a program
-     is rejected rather than translated to [abort]. *)
   | Cassert a =>
       Let _ := assert assert_allowed (assert_error ii) in
       Let b := toEC_assert ii a.2 in
@@ -897,9 +919,6 @@ Definition toEC_c (p : _uprog) (c : seq instr) : cexec pwcmd :=
 (* 8. Programs                                                         *)
 (* -------------------------------------------------------------------- *)
 
-(* Jasmin function names are pwhile function names directly: [funname] is
-   an eqType (var.v), so no injection into [nat] is needed.  There is no
-   global-initialisation prelude either, since there are no globals. *)
 Definition toEC_fd (p : _uprog) (fd : _ufundef) : cexec pwcmd :=
   toEC_c p fd.(f_body).
 
@@ -922,10 +941,6 @@ Definition toEC_ps (p : _uprog) : cexec (funname -> pwcmd) :=
   Let l := toEC_funcs p in ok (pw_assoc l).
 
 (* -------------------------------------------------------------------- *)
-(* The three rejection cases are reachable, not dead branches.  Stated
-   over abstract data, since Jasmin seals [Ident.ident] ([Cident :
-   CORE_IDENT]) and no concrete variable can be built in Coq. *)
-
 Lemma pwgvar_glob (ii : instr_info) (x : gvar) :
   x.(gs) = Sglob -> pwgvar ii x = Error (global_error ii).
 Proof. by move=> h; rewrite /pwgvar h. Qed.
