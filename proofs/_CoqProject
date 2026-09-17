@@ -177,6 +177,7 @@ toEC/remove_nullary_opns_proof.v
 toEC/legalize_names.v
 toEC/legalize_names_proof.v
 toEC/toEC.v
+toEC/toEC_example.v
 toEC/toEC_proof.v
 toEC/toEC_jazz.v
 toEC/toEC_jazz_proof.v

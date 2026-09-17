@@ -2,28 +2,40 @@
 (* Worked examples for [toEC.v]: concrete Jasmin programs, run through   *)
 (* the translation.                                                     *)
 (*                                                                      *)
-(* These are smoke tests, not proofs about the semantics: each lemma     *)
-(* says the translation *succeeds* (reduces to [ok]) on a program of the *)
-(* shape [toEC_prog] produces, and the last one pins down the syntactic  *)
-(* image of a [Ccall].                                                   *)
+(* These are smoke tests, not proofs about the semantics.  They come in  *)
+(* two kinds: the translation *succeeds* (reduces to [ok]) on programs   *)
+(* of the shape the earlier passes leave behind, and it *rejects* -- with *)
+(* the right message -- the constructs the current design cannot model.  *)
+(* Two lemmas also pin down the syntactic image of a [Cassert] and of a  *)
+(* [Ccall].                                                             *)
 (*                                                                      *)
-(* Two things have to stay abstract, because Jasmin seals them:          *)
+(* Three things have to stay abstract, because Jasmin seals them:        *)
 (*   - [Ident.ident] ([Cident : CORE_IDENT], var.v/ident.v), so variable *)
 (*     names cannot be built in Coq;                                     *)
-(*   - [funname] ([FunName : TaggedCore], var.v:11).                     *)
+(*   - [funname] ([FunName : TaggedCore], var.v);                        *)
+(*   - the architecture, which is why no example uses [Copn] -- that     *)
+(*     needs [get_instr_desc], hence a concrete [asm_extra].             *)
 (* Consequently [get_fundef] does not compute on an abstract [funname]   *)
 (* and the call lemmas go through [eqxx] rather than [by []].            *)
 (*                                                                      *)
-(* The architecture is abstract too, which is why no example uses [Copn] *)
-(* -- that needs [get_instr_desc], hence a concrete [asm_extra].         *)
+(* [R] must be given by name in every call: it occurs only in the result *)
+(* type of [toEC_c] / [toEC_ps] ([pwcmd] is a [cmd_ R ...]), so it       *)
+(* cannot be inferred from the arguments.  [wsw] and [wa] are classes,   *)
+(* so instance resolution finds them. *)
 (* ==================================================================== *)
 From mathcomp Require Import ssreflect ssrfun ssrbool ssrnat eqtype seq.
+From mathcomp.reals Require Import reals.
 Require Import compiler_util expr arch_decl arch_extra.
-Require Import utils type sem_type values warray_ word wsize xseq.
+Require Import utils type sem_type sem_params values warray_ word wsize xseq.
+Require Import low_memory.
 Require Import toEC.
-From xhl.pwhile Require Import inhabited_new pwhile_new.
+Import toEC.E.   (* [Module Import E] is not re-exported by [toEC.v] *)
+From xhl.pwhile Require Import inhabited pwhile.
 
 Section EXAMPLE.
+
+Context {R : realType}.
+Context {wsw : WithSubWord}.
 
 Context
   {reg regx xreg rflag cond asm_op extra_op : Type}
@@ -31,7 +43,11 @@ Context
 
 #[local] Existing Instance progUnit.
 
-Context (to_ident : var -> nat) (to_fname : funname -> nat).
+(* Assertions are enabled: [sem_assert] begins with
+   [assert assert_allowed ErrType], so under [noassert] a [Cassert] has no
+   successful run and the translation rejects it -- see
+   [example_assert_rejected] at the end, which overrides this instance. *)
+#[local] Existing Instance withassert.
 
 Context (nn ss ii_ tt_ aa_ bb_ rr_ qq_ : Ident.ident).
 
@@ -102,38 +118,79 @@ Context (fn_f : funname).
 Definition prog : _uprog :=
   {| p_funcs := [:: (fn_f, fd_f) ]; p_globs := [::]; p_extra := tt |}.
 
-Lemma example_body_ok : is_ok (toEC_c to_ident to_fname prog body).
+Lemma example_body_ok : is_ok (toEC_c (R:=R) prog body).
 Proof. by []. Qed.
 
-Lemma example_prog_ok : is_ok (toEC_ps to_ident to_fname prog).
+Lemma example_prog_ok : is_ok (toEC_ps (R:=R) prog).
 Proof. by []. Qed.
 
 (* ==================================================================== *)
-(* 2. An assertion                                                       *)
+(* 2. Memory                                                             *)
 (* ==================================================================== *)
 
-(*  assert (i < 4);   becomes   If <i < 4> then skip else abort.
-    [legalize_names] removes assertions, but the translation no longer
-    depends on that. *)
-Context (lbl : assertion_label).
+(*  s = [u64 n];        becomes   s <<- read <mem> n U64
+    [u64 n] = s;        becomes   G <mem> <<- write <mem> n s
 
-Definition body_assert : seq instr :=
-  [:: MkI II (Cassert (lbl, Pexpr (Papp2 (Olt Cmp_int) (E_ v_i) (Pconst 4)))) ].
+    The global store holds exactly one slot, whose code interprets to
+    Jasmin's [mem], so both sides are Jasmin's own [read] / [write] with
+    validity and alignment intact -- not an array encoding.  A failing
+    access falls back to a default, per the total-denotation convention. *)
+Definition body_mem : seq instr :=
+  [::
+    MkI II (Cassgn (Lvar (V v_s)) AT_none (aword U64)
+              (Pload Aligned U64 (E_ v_n)));
+    MkI II (Cassgn (Lmem Aligned U64 dummy_var_info (E_ v_n))
+              AT_none (aword U64) (E_ v_s))
+  ].
 
-Lemma example_assert_ok : is_ok (toEC_c to_ident to_fname prog body_assert).
+Lemma example_mem_ok : is_ok (toEC_c (R:=R) prog body_mem).
 Proof. by []. Qed.
 
-(* the image really is a two-armed conditional ending in [abort] *)
-Lemma example_assert_shape :
-  match rdflt pwhile_new.abort (toEC_c to_ident to_fname prog body_assert) with
-  | pwhile_new.seqc (pwhile_new.cond _ pwhile_new.skip pwhile_new.abort)
-                    pwhile_new.skip => True
+(* The load reads the memory slot and the store writes it: the image is an
+   [assign] to a local followed by a [gassign] to the one global. *)
+Lemma example_mem_shape :
+  match rdflt pwhile.abort (toEC_c (R:=R) prog body_mem) with
+  | pwhile.seqc (pwhile.assign _ _ _)
+                (pwhile.seqc (pwhile.gassign _ _ _) pwhile.skip) => True
   | _ => False
   end.
 Proof. by []. Qed.
 
 (* ==================================================================== *)
-(* 3. A procedure call                                                   *)
+(* 3. Assertions                                                         *)
+(* ==================================================================== *)
+
+(*  assert (i < 4);   becomes   If <i < 4> then skip else abort. *)
+Context (lbl : assertion_label).
+
+Definition body_assert : seq instr :=
+  [:: MkI II (Cassert (lbl, Pexpr (Papp2 (Olt Cmp_int) (E_ v_i) (Pconst 4)))) ].
+
+Lemma example_assert_ok : is_ok (toEC_c (R:=R) prog body_assert).
+Proof. by []. Qed.
+
+(* the image really is a two-armed conditional ending in [abort] *)
+Lemma example_assert_shape :
+  match rdflt pwhile.abort (toEC_c (R:=R) prog body_assert) with
+  | pwhile.seqc (pwhile.cond _ pwhile.skip pwhile.abort) pwhile.skip => True
+  | _ => False
+  end.
+Proof. by []. Qed.
+
+(*  assert (is_init [n : 8]);
+
+    [Pis_mem_init] is now translated faithfully -- it is exactly
+    [sem_eassert]'s [all (fun i => is_ok (read mm Unaligned (lo + i) U8))
+    (ziota 0 sz)].  The old array encoding of the memory could only stub it
+    as [cst_ true]. *)
+Definition body_mem_init : seq instr :=
+  [:: MkI II (Cassert (lbl, Pis_mem_init (E_ v_n) (Pconst 8))) ].
+
+Lemma example_mem_init_ok : is_ok (toEC_c (R:=R) prog body_mem_init).
+Proof. by []. Qed.
+
+(* ==================================================================== *)
+(* 4. A procedure call                                                   *)
 (* ==================================================================== *)
 
 (*  fn add(reg u64 a, reg u64 b) -> reg u64 { reg u64 r; r = a + b; return r; }
@@ -173,7 +230,7 @@ Definition fd_g : _ufundef :=
 Definition prog_call : _uprog :=
   {| p_funcs := [:: (fn_add, fd_add) ]; p_globs := [::]; p_extra := tt |}.
 
-Lemma example_call_ok : is_ok (toEC_c to_ident to_fname prog_call body_g).
+Lemma example_call_ok : is_ok (toEC_c (R:=R) prog_call body_g).
 Proof. by rewrite /toEC_c /body_g /= eqxx. Qed.
 
 (* The image of [Ccall]: a [block] whose entry bindings are the callee's
@@ -183,14 +240,58 @@ Proof. by rewrite /toEC_c /body_g /= eqxx. Qed.
    the caller's locals while keeping the callee's globals).
 
    The two binding lists have the callee's arities: 2 parameters in, 1
-   result out. *)
+   result out.  The pwhile function name is the Jasmin [funname] itself --
+   [funname] is an eqType, so no injection into [nat] is needed. *)
 Lemma example_call_shape :
-  match rdflt pwhile_new.abort (toEC_c to_ident to_fname prog_call body_g) with
-  | pwhile_new.seqc (pwhile_new.block bs (pwhile_new.call f) rs)
-                    pwhile_new.skip =>
-      [/\ f = pw_fun_id to_fname fn_add, size bs = 2 & size rs = 1 ]
+  match rdflt pwhile.abort (toEC_c (R:=R) prog_call body_g) with
+  | pwhile.seqc (pwhile.block bs (pwhile.call f) rs) pwhile.skip =>
+      [/\ f = fn_add, size bs = 2 & size rs = 1 ]
   | _ => False
   end.
 Proof. by rewrite /toEC_c /body_g /= eqxx. Qed.
+
+(* ==================================================================== *)
+(* 5. What the translation rejects                                       *)
+(* ==================================================================== *)
+
+(* There are no global variables: the global store holds only the memory,
+   so a [Sglob] read is refused rather than approximated.
+   [remove_globals] must have run. *)
+Lemma example_glob_rejected :
+  toEC_c (R:=R) prog
+    [:: MkI II (Cassgn (Lvar (V v_s)) AT_none (aword U64)
+                  (Pvar (mk_gvar (V v_n)))) ]
+  = Error (global_error II).
+Proof. by []. Qed.
+
+(* [is_init x] reads [is_defined (evm s).[x]], and [interp t] has no
+   undefined inhabitant, so the predicate is not representable.  It is
+   refused rather than approximated by [true], which would let the pwhile
+   program run on exactly where Jasmin aborts. *)
+Lemma example_var_init_rejected :
+  toEC_c (R:=R) prog [:: MkI II (Cassert (lbl, Pis_var_init (V v_i))) ]
+  = Error (init_error II).
+Proof. by []. Qed.
+
+(* [for_to_while] must have run. *)
+Lemma example_cfor_rejected (x : var_i) (r : range) (c : seq instr) :
+  toEC_c (R:=R) prog [:: MkI II (Cfor x r c) ] = Error (cfor_error II).
+Proof. by []. Qed.
+
+(* [flatten_while] must have run: a [Cwhile] with a non-empty pre-block is
+   refused. *)
+Lemma example_cwhile_rejected (e : pexpr) (c1 c2 : seq instr) :
+  c1 <> [::] ->
+  toEC_c (R:=R) prog [:: MkI II (Cwhile NoAlign c1 e II c2) ]
+  = Error (cwhile_error II).
+Proof. by case: c1 => // a l _. Qed.
+
+(* Under [noassert] a [Cassert] instruction fails in Jasmin
+   ([sem_assert]'s leading [assert assert_allowed ErrType]), so the
+   translation refuses it instead of emitting [abort].  This is the one
+   lemma that overrides the section's [withassert] instance. *)
+Lemma example_assert_rejected :
+  toEC_c (R:=R) (wa:=noassert) prog body_assert = Error (assert_error II).
+Proof. by []. Qed.
 
 End EXAMPLE.
