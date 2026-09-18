@@ -73,7 +73,6 @@ End E.
 (* -------------------------------------------------------------------- *)
 (* 1. Jasmin's types as a pwhile code alphabet                          *)
 (* -------------------------------------------------------------------- *)
-
 HB.instance Definition Z_eqType_  := gen_eqMixin Z.
 HB.instance Definition Z_chType_  := gen_choiceMixin Z.
 HB.instance Definition Z_inhab    := isInhab.Build Z 0%Z.
@@ -146,7 +145,6 @@ Proof. by rewrite /jof_val /jval /tot of_val_to_val /=; apply: to_of_interp. Qed
 (* -------------------------------------------------------------------- *)
 (* 2. Randomness: the image of [Csyscall (RandomBytes ws n)]            *)
 (* -------------------------------------------------------------------- *)
-
 Definition all_bytes : seq u8 := [seq wrepr U8 k | k <- ziota 0 256].
 
 Fixpoint drand_arr {R: realType} (len : Z) (idxs : seq Z) (a : WArray.array len)
@@ -159,6 +157,7 @@ Fixpoint drand_arr {R: realType} (len : Z) (idxs : seq Z) (a : WArray.array len)
 
 Definition drandbytes {R: realType} (len : Z) : { distr (WArray.array len) / R } :=
   drand_arr len (ziota 0 len) (WArray.empty len).
+
 
 (* -------------------------------------------------------------------- *)
 (* 3. A Jasmin state as a pwhile memory                                 *)

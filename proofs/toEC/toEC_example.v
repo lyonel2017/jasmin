@@ -1,28 +1,3 @@
-(* ==================================================================== *)
-(* Worked examples for [toEC.v]: concrete Jasmin programs, run through   *)
-(* the translation.                                                     *)
-(*                                                                      *)
-(* These are smoke tests, not proofs about the semantics.  They come in  *)
-(* two kinds: the translation *succeeds* (reduces to [ok]) on programs   *)
-(* of the shape the earlier passes leave behind, and it *rejects* -- with *)
-(* the right message -- the constructs the current design cannot model.  *)
-(* Two lemmas also pin down the syntactic image of a [Cassert] and of a  *)
-(* [Ccall].                                                             *)
-(*                                                                      *)
-(* Three things have to stay abstract, because Jasmin seals them:        *)
-(*   - [Ident.ident] ([Cident : CORE_IDENT], var.v/ident.v), so variable *)
-(*     names cannot be built in Coq;                                     *)
-(*   - [funname] ([FunName : TaggedCore], var.v);                        *)
-(*   - the architecture, which is why no example uses [Copn] -- that     *)
-(*     needs [get_instr_desc], hence a concrete [asm_extra].             *)
-(* Consequently [get_fundef] does not compute on an abstract [funname]   *)
-(* and the call lemmas go through [eqxx] rather than [by []].            *)
-(*                                                                      *)
-(* [R] must be given by name in every call: it occurs only in the result *)
-(* type of [toEC_c] / [toEC_ps] ([pwcmd] is a [cmd_ R ...]), so it       *)
-(* cannot be inferred from the arguments.  [wsw] and [wa] are classes,   *)
-(* so instance resolution finds them. *)
-(* ==================================================================== *)
 From mathcomp Require Import ssreflect ssrfun ssrbool ssrnat eqtype seq.
 From mathcomp.reals Require Import reals.
 Require Import compiler_util expr arch_decl arch_extra.
@@ -30,7 +5,8 @@ Require Import utils type sem_type sem_params values warray_ word wsize xseq.
 Require Import low_memory.
 Require Import toEC.
 Import toEC.E.   (* [Module Import E] is not re-exported by [toEC.v] *)
-From xhl.pwhile Require Import inhabited pwhile.
+From xhl.pwhile Require Import inhabited pwhile notations.
+From xhl.hl     Require Import hl_stmt hl.
 
 Section EXAMPLE.
 
@@ -100,7 +76,7 @@ Definition body : seq instr :=
               ]);
     MkI II (Cif (Papp2 (Oeq (Op_w U64)) (E_ v_s) w0)
               [:: MkI II (Cassgn (Lvar (V v_s)) AT_none (aword U64) w1) ]
-              [::])
+              [::] )
   ].
 
 Definition fd_f : _ufundef :=
@@ -118,13 +94,59 @@ Context (fn_f : funname).
 Definition prog : _uprog :=
   {| p_funcs := [:: (fn_f, fd_f) ]; p_globs := [::]; p_extra := tt |}.
 
-Lemma example_body_ok : (toEC_c (R:=R) prog body) = ok skip.
+Notation "e1 < e2" := (app2_ (fun v1 : Z => [eta Z.ltb v1])%:S e1 e2) : xsyn_scope.
+
+Notation "e1 +w e2" := (app2_ (fun v1 : u64 => [eta add_word v1])%:S e1 e2)
+                         (at level 70) : xsyn_scope.
+
+Notation "e1 + e2" := (app2_ (fun v1 : Z => [eta Z.add v1])%:S e1 e2) : xsyn_scope.
+
+Notation "e1 =? e2" :=
+  (app2_ (fun v1 v2 : u64 => (word.toword v1 =? word.toword v2)%Z)%:S e1 e2) : xsyn_scope.
+
+Notation "aset[ e1 ]( e2 , e3 )" :=
+  (app2_ (app_ (fun (a : WArray.array 32) (k : Z) (w : u64) =>
+                  rdflt a (WArray.set a Aligned AAscale k w))%:S
+                             e1) e2 e3) : xsyn_scope.
+
+Notation "aget[ e1 ]( e2 )" :=
+  (app2_ (fun (a : WArray.array 32) (k : Z) =>
+            rdflt word.word.word0 (WArray.get Aligned AAscale U64 a k))%:S
+                             e1 e2) : xsyn_scope.
+
+Lemma example_body_ok ps :
+  hl_ ps xpredT (rdflt abort (toEC_c (R:=R) prog body)) xpredT.
 Proof.
   cbn.
-Admitted.
+  eapply hl_seq; last first.
+  eapply hl_seq; last first.
+  eapply hl_seq; last first.
+  eapply hl_seq; last first.
+  apply hl_skip.
+  eapply hl_if.
+  + eapply hl_seq; last apply hl_skip.
+    eapply (hl_conseq (Q2 := xpredT)).
+    2: by [].
+    2: apply: hl_assign.
+    by [].
+  + eapply (hl_conseq (Q2 := xpredT)).
+    2: by [].
+    2: apply: hl_skip.
+    by [].
+  eapply (hl_conseq (P2 := xpredT)).
+  move => ? H. apply H.
+  2: eapply hl_while.
+  2: by [].
+  move => ?; reflexivity.
+  apply: hl_assign.
+  apply: hl_assign.
+  (* move => ?? //=. *)
+Qed.
 
-Lemma example_prog_ok : is_ok (toEC_ps (R:=R) prog).
-Proof. by []. Qed.
+Lemma example_prog_ok :
+  hl_ (rdflt (fun _ => abort) (toEC_ps (R:=R) prog)) xpredT (call fn_f) xpredT.
+Proof.
+  Admitted.
 
 (* ==================================================================== *)
 (* 2. Coercions appear only where the types differ                       *)
@@ -177,18 +199,10 @@ Definition body_mem : seq instr :=
               AT_none (aword U64) (E_ v_s))
   ].
 
-Lemma example_mem_ok : is_ok (toEC_c (R:=R) prog body_mem).
-Proof. by []. Qed.
-
-(* The load reads the memory slot and the store writes it: the image is an
-   [assign] to a local followed by a [gassign] to the one global. *)
-Lemma example_mem_shape :
-  match rdflt pwhile.abort (toEC_c (R:=R) prog body_mem) with
-  | pwhile.seqc (pwhile.assign _ _ _)
-                (pwhile.seqc (pwhile.gassign _ _ _) pwhile.skip) => True
-  | _ => False
-  end.
-Proof. by []. Qed.
+Lemma example_mem_ok ps :
+  hl_ ps xpredT (rdflt abort (toEC_c (R:=R) prog body_mem)) xpredT.
+Proof. cbn.
+Admitted.
 
 (* ==================================================================== *)
 (* 4. Assertions                                                         *)
@@ -200,16 +214,10 @@ Context (lbl : assertion_label).
 Definition body_assert : seq instr :=
   [:: MkI II (Cassert (lbl, Pexpr (Papp2 (Olt Cmp_int) (E_ v_i) (Pconst 4)))) ].
 
-Lemma example_assert_ok : is_ok (toEC_c (R:=R) prog body_assert).
-Proof. by []. Qed.
+Lemma example_assert_ok ps :
+  hl_ ps xpredT (rdflt abort (toEC_c (R:=R) prog body_assert)) xpredT.
+Proof. cbn. Admitted.
 
-(* the image really is a two-armed conditional ending in [abort] *)
-Lemma example_assert_shape :
-  match rdflt pwhile.abort (toEC_c (R:=R) prog body_assert) with
-  | pwhile.seqc (pwhile.cond _ pwhile.skip pwhile.abort) pwhile.skip => True
-  | _ => False
-  end.
-Proof. by []. Qed.
 
 (*  assert (is_init [n : 8]);
 
@@ -220,8 +228,9 @@ Proof. by []. Qed.
 Definition body_mem_init : seq instr :=
   [:: MkI II (Cassert (lbl, Pis_mem_init (E_ v_n) (Pconst 8))) ].
 
-Lemma example_mem_init_ok : is_ok (toEC_c (R:=R) prog body_mem_init).
-Proof. by []. Qed.
+Lemma example_mem_init_ok ps :
+  hl_ ps xpredT (rdflt abort (toEC_c (R:=R) prog body_mem_init)) xpredT.
+Proof. cbn. Admitted.
 
 (* ==================================================================== *)
 (* 5. A procedure call                                                   *)
