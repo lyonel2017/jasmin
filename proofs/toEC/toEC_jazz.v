@@ -28,14 +28,14 @@ Definition toEC_prog (p : _uprog) : cexec _uprog :=
   let p3 := flatten_while_prog p2 in
   Let p4 := remove_baseop_casts_prog fresh_var_ident p3 in
   Let p6 := mce_prog p4 in
-  remove_nullary_opns_prog p6
+  ok (remove_nullary_opns_prog p6).
 
 Section TO_PWHILE.
 
 Context {R : realType} {wsw : WithSubWord} {wa : WithAssert}.
 
-Definition toEC_pwhile (normal : bool) (p : _uprog) :=
-  Let p' := toEC_prog normal p in
+Definition toEC_pwhile (p : _uprog) :=
+  Let p' := toEC_prog  p in
   toEC_ps (R:=R) p'.
 
 End TO_PWHILE.

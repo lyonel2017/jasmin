@@ -168,14 +168,10 @@ toEC/flatten_while.v
 toEC/flatten_while_proof.v
 toEC/remove_baseop_casts.v
 toEC/remove_baseop_casts_proof.v
-toEC/normalize_calls.v
-toEC/normalize_calls_proof.v
 toEC/make_coercions_explicit.v
 toEC/make_coercions_explicit_proof.v
 toEC/remove_nullary_opns.v
 toEC/remove_nullary_opns_proof.v
-toEC/legalize_names.v
-toEC/legalize_names_proof.v
 toEC/toEC.v
 toEC/toEC_example.v
 toEC/toEC_proof.v
