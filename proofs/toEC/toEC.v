@@ -68,6 +68,10 @@ Module Import E.
     pp_internal_error_s_at pass ii
       "assert with assertions disabled always fails".
 
+ Definition unsafe_op (ii : instr_info) :=
+    pp_internal_error_s_at pass ii
+      "unsafe operator".
+
 End E.
 
 (* -------------------------------------------------------------------- *)
@@ -84,7 +88,6 @@ HB.instance Definition warr_chType_ (n : Z) := gen_choiceMixin (WArray.array n).
 HB.instance Definition warr_inhab   (n : Z) :=
   isInhab.Build (WArray.array n) (WArray.empty n).
 
-(* The alphabet: a Jasmin value type is a pwhile type code. *)
 Definition jinterp (t : ctype) : inhabType :=
   match t with
   | cbool   => (bool : inhabType)
@@ -135,7 +138,6 @@ Arguments nth_out : clear implicits.
 Definition jval (t : ctype) (v : interp t) : value := to_val (of_interp t v).
 Arguments jval : clear implicits.
 
-(* [jof_val] undoes [jval].  This is the roundtrip that [mget_eq_] rests on. *)
 Lemma to_of_interp (t : ctype) (v : interp t) : to_interp t (of_interp t v) = v.
 Proof. by case: t v => [ | | n | s] v. Qed.
 
@@ -158,29 +160,12 @@ Fixpoint drand_arr {R: realType} (len : Z) (idxs : seq Z) (a : WArray.array len)
 Definition drandbytes {R: realType} (len : Z) : { distr (WArray.array len) / R } :=
   drand_arr len (ziota 0 len) (WArray.empty len).
 
-
 (* -------------------------------------------------------------------- *)
 (* 3. A Jasmin state as a pwhile memory                                 *)
 (* -------------------------------------------------------------------- *)
 
-(* Jasmin's memory is the *only* thing in the global store: there are no
-   global variables, so the global alphabet has a single code whose
-   interpretation is [mem] itself, and a single identifier.  That is what
-   makes [emem : mem] a genuine field rather than a slot in an encoding --
-   the old [WArray (wbase Uptr)] cell existed only because the mixin used
-   to have one alphabet, with no code for [mem]. *)
-
-(* [mem] has no derivable inhabitant: it is [Parameter mem : PointerData ->
-   Type] (memory_model.v) whose only constructor in [MemoryT] is
-   [init : seq (pointer * Z) -> pointer -> exec mem], with no success spec.
-   [isTypeCode] needs an inhabited interpretation, so one is assumed. *)
 Axiom mem_witness : forall {pd : PointerData}, @mem pd.
 
-(* [gcode] is parameterized by [pd] on purpose: [ginterp Gmem] is [@mem pd],
-   so an instance on a bare [gcode] would discharge to [forall pd,
-   isTypeCode gcode] with [pd] undetermined by the key, and [interp Gmem]
-   would carry an unresolvable evar.  Same idiom as Jasmin's own
-   [Arguments mem {_}]. *)
 Variant gcode (pd : PointerData) := Gmem.
 Arguments gcode {_}.
 Arguments Gmem {_}.
@@ -216,9 +201,7 @@ Proof. by []. Qed.
 End GCode.
 
 (* The two identifier types.  Locals are named by Jasmin variables; the
-   global store holds only the memory, so one identifier suffices -- and
-   that is what makes [mgetg_neq_] vacuous at [Gmem]/[Gmem].  These are
-   notations, so [gcode]'s implicit [pd] resolves at the use site. *)
+   global store holds only the memory *)
 Notation jident  := var.
 Notation jidentg := unit.
 Notation jgcode  := (gcode : codeType).
@@ -229,18 +212,7 @@ Section Mem.
   Context {pd  : PointerData}.   (* for [mem]  *)
 
 (* -------------------------------------------------------------------- *)
-(* Keys.
-
-   [Vm.set vm x v] stores [vm_truncate_val (eval_atype (Var.vtype x)) v]
-   (varmap.v), so a slot may only be keyed by a variable whose type is the
-   one being written -- otherwise the value read back is not the one that
-   was written, and [mget_eq_] fails.  [atype_of_ctype] rebuilds that type
-   from the pwhile type code, which makes the truncation the identity by
-   construction, with no runtime check.
-
-   It is a section of [eval_atype] -- which is itself *not* injective,
-   since [aarr U16 4] and [aarr U8 8] share the [ctype] [carr 8] -- and is
-   therefore injective. *)
+(* Keys. *)
 Definition atype_of_ctype (t : ctype) : atype :=
   match t with
   | cbool   => abool
@@ -270,23 +242,12 @@ move=> h; apply/eqP => -[] e1 e2; case: h => [ne | /eqP ne].
 by apply: ne.
 Qed.
 
-(* The point of the whole scheme: at a key built by [key], Jasmin's
-   truncation on write is the identity, so nothing is lost. *)
 Lemma vm_truncate_val_jval (t : ctype) (v : interp t) :
   vm_truncate_val t (jval t v) = jval t v.
 Proof. by apply: vm_truncate_val_eq; exact: type_of_to_val. Qed.
 
 (* -------------------------------------------------------------------- *)
-(* The state.
-
-   This is Jasmin's [estate] minus [escs]: [emem] is Jasmin's memory,
-   verbatim.  [evm] is the local store -- a family of Jasmin varmaps
-   indexed by the Jasmin type rather than a single one, because [key]
-   pins the in-map variable's type to [atype_of_ctype T] (so that
-   [Vm.set]'s truncation is the identity) and that leaves only the
-   [ident] component free.  Making the Jasmin type the family index is
-   what keeps two variables sharing a name but not a type -- which
-   [eval_atype] would otherwise conflate -- in distinct slots. *)
+(* The state. *)
 Record jstate := Jstate {
   emem : mem;
   evm  : atype -> Vm.t
@@ -304,12 +265,7 @@ Lemma fupd_neq (f : atype -> Vm.t) (a b : atype) (vm : Vm.t) :
 Proof. by rewrite /fupd => /negbTE ->. Qed.
 
 (* -------------------------------------------------------------------- *)
-(* Local memory.
-
-   [jget] is Jasmin's [get_var] with the definedness check replaced by a
-   default -- [interp t] has no undefined inhabitant, so the check is
-   vacuous -- and [jset] is [set_var] with the truncation check replaced
-   by the retyped key, which makes it succeed by construction. *)
+(* Local memory.*)
 Definition jget (m : jstate) (t : ctype) (x : jident) : interp t :=
   jof_val t (evm m (Var.vtype x)).[key t (Var.vname x)]%vm.
 
@@ -319,31 +275,20 @@ Definition jset (m : jstate) (t : ctype) (x : jident) (v : interp t) : jstate :=
        (evm m (Var.vtype x)).[key t (Var.vname x) <- jval t v]%vm).
 
 (* -------------------------------------------------------------------- *)
-(* Global memory: Jasmin's memory, and nothing else.  Both operations are
-   a dependent match on the single code -- no [type_eq_dec], no [ecast]
-   and no heterogeneous update. *)
+(* Global memory.*)
 Definition jgetg (m : jstate) (T : jgcode) (_ : jidentg) : interp T :=
   match T return interp T with Gmem => emem m end.
 
 Definition jsetg (m : jstate) (T : jgcode) (_ : jidentg) (v : interp T) : jstate :=
   match T return interp T -> jstate with Gmem => fun v => Jstate v (evm m) end v.
 
-(* Frame entry and exit.  No law forces [jnew] to clear the locals (there
-   is no [mget_new_]), but leaving them would let a callee read the
-   caller's frame through [minit]. *)
 Definition jnew (m : jstate) : jstate := Jstate (emem m) (fun _ => Vm.init).
 
 Definition jrestore (m0 m : jstate) : jstate := Jstate (emem m) (evm m0).
 
-(* Jasmin's memory, as a pwhile global variable: [gvar_ memv] is an
-   expression of type [interp Gmem = mem], so [Pload] / [Lmem] translate
-   through Jasmin's own [read] / [write] rather than an array encoding. *)
 Definition memv : vars_ jidentg (@Gmem pd) := pwhile.Var (@Gmem pd) tt.
 
 (* -------------------------------------------------------------------- *)
-(* The [isMemType] laws.  [mset_eq_] is no longer one of them, so [jset]
-   needs no equality short-circuit and [interp t] need not be an eqType. *)
-
 Lemma jget_jset (t : ctype) (m : jstate) (x : jident) (v : interp t) :
   jget (jset m t x v) t x = v.
 Proof.
@@ -367,9 +312,6 @@ Lemma jgetg_jsetg (T : jgcode) (m : jstate) (u : jidentg) (v : interp T) :
   jgetg (jsetg m T u v) T u = v.
 Proof. by case: T v => v. Qed.
 
-(* Vacuous: [jgcode] has one code and [jidentg] one identifier, so the
-   premise is unsatisfiable.  This is exactly what having a dedicated
-   alphabet for the global store buys -- the memory is a single slot. *)
 Lemma jgetg_jsetg_neq (T U : jgcode) (m : jstate) (u u' : jidentg)
     (v : interp T) :
   (T <> U \/ u != u') -> jgetg (jsetg m T u v) U u' = jgetg m U u'.
@@ -439,31 +381,23 @@ HB.instance Definition jstate_memType :=
 Definition jmem : memType jcode jgcode jident jidentg := jstate.
 
 (* -------------------------------------------------------------------- *)
-(* Sanity checks: the instance found by canonical structure resolution is
-   the one defined above, and it separates the slots it is meant to. *)
+(* Example mget_mset_j (t : ctype) (m : jstate) (x : jident) (v : interp t) : *)
+(*   @mget jcode jgcode jident jidentg jstate t *)
+(*     (@mset jcode jgcode jident jidentg jstate t m x v) x = v. *)
+(* Proof. exact: mget_eq. Qed. *)
 
-Example mget_mset_j (t : ctype) (m : jstate) (x : jident) (v : interp t) :
-  @mget jcode jgcode jident jidentg jstate t
-    (@mset jcode jgcode jident jidentg jstate t m x v) x = v.
-Proof. exact: mget_eq. Qed.
+(* Example mgetg_msetg_mem (m : jstate) (mm : mem) : *)
+(*   @mgetg jcode jgcode jident jidentg jstate (@Gmem pd) *)
+(*     (@msetg jcode jgcode jident jidentg jstate (@Gmem pd) m tt mm) tt = mm. *)
+(* Proof. exact: mgetg_eq. Qed. *)
 
-(* The memory round-trips through the instance, at [mem] itself. *)
-Example mgetg_msetg_mem (m : jstate) (mm : mem) :
-  @mgetg jcode jgcode jident jidentg jstate (@Gmem pd)
-    (@msetg jcode jgcode jident jidentg jstate (@Gmem pd) m tt mm) tt = mm.
-Proof. exact: mgetg_eq. Qed.
-
-(* Two Jasmin variables sharing a name but not a type keep distinct slots,
-   even when [eval_atype] conflates their types: [aarr U16 4] and
-   [aarr U8 8] both evaluate to [carr 8].  This is what the [atype]-indexed
-   family buys over keying the store by a bare [Ident.ident]. *)
-Example slots_distinct (n : Ident.ident) (m : jstate) (a : interp (carr 8)) :
-  @mget jcode jgcode jident jidentg jstate (carr 8)
-    (@mset jcode jgcode jident jidentg jstate (carr 8) m
-       (Var.Var (aarr U16 4) n) a)
-    (Var.Var (aarr U8 8) n)
-  = @mget jcode jgcode jident jidentg jstate (carr 8) m (Var.Var (aarr U8 8) n).
-Proof. by apply: mget_neq; right. Qed.
+(* Example slots_distinct (n : Ident.ident) (m : jstate) (a : interp (carr 8)) : *)
+(*   @mget jcode jgcode jident jidentg jstate (carr 8) *)
+(*     (@mset jcode jgcode jident jidentg jstate (carr 8) m *)
+(*        (Var.Var (aarr U16 4) n) a) *)
+(*     (Var.Var (aarr U8 8) n) *)
+(*   = @mget jcode jgcode jident jidentg jstate (carr 8) m (Var.Var (aarr U8 8) n). *)
+(* Proof. by apply: mget_neq; right. Qed. *)
 
 End Mem.
 
@@ -477,22 +411,13 @@ Context {wsw : WithSubWord}.   (* [Vm.t], hence [jstate] / [jmem] *)
 Context {wa  : WithAssert}.    (* [assert_allowed] *)
 Context
   {reg regx xreg rflag cond asm_op extra_op : Type}
-  {asm_e : asm_extra reg regx xreg rflag cond asm_op extra_op}
-.
-
-(* [PointerData] needs no [Context] of its own: [arch_pd] (arch_decl.v)
-   derives it from [asm_e]. *)
+  {asm_e : asm_extra reg regx xreg rflag cond asm_op extra_op}.
 
 #[local] Existing Instance progUnit.
 
 Notation pexp T := (expr_ jcode jgcode jident jidentg jmem T).
 Notation pwcmd  := (@cmd_ R jcode jgcode jident jidentg jmem funname).
 
-(* A Jasmin variable *is* a pwhile local identifier, so no injection is
-   needed.  [pwvar] is injective; [eval_atype] is not, so [x : u16[4]] and
-   [x : u8[8]] get the same type code -- they still occupy distinct slots,
-   which is what the [atype]-indexed [evm] family buys, and Jasmin's own
-   [convertible] already identifies those two types. *)
 Definition pwvar (x : var) : vars_ jident (eval_atype (jtype x)) :=
   pwhile.Var (eval_atype (jtype x)) x.
 
@@ -502,83 +427,114 @@ Definition texp := { t : ctype & pexp (interp t) }.
 Definition mk_texp (t : ctype) (e : pexp (interp t)) : texp := existT _ t e.
 Arguments mk_texp : clear implicits.
 
-Definition texp_ty (te : texp) : ctype := projT1 te.
-
 (* -------------------------------------------------------------------- *)
-(* Coercion, emitted only when the types really differ.  When they agree
-   the expression is returned untouched, which is sound because
-   [jof_val t (jval t v) = v] ([jof_val_jval] above) -- so the wrapper it
-   replaces denoted the identity anyway.  Otherwise the coercion is
-   exactly Jasmin's own [truncate_val = of_val . to_val], total: no
-   [cexec] and no failure case.
-
-   [arch_extra.ctype_eq_dec] is used rather than [type_eq_dec]
-   (xhl/inhabited.v).  The latter goes through [ctype_eqb_OK], which
-   elpi's [derive] closes with [Qed], so it does not reduce: [vm_compute]
-   leaves [type_eq_dec cint cint] stuck on it, and the [ecast] below would
-   survive as residue instead of vanishing.  [ctype_eq_dec] is hand-written
-   and [Defined] precisely so that it reduces to [left erefl] on concrete
-   arguments -- see the comment at arch_extra.v. *)
-Definition coerce (tsrc tdst : ctype) (e : pexp (interp tsrc)) : pexp (interp tdst) :=
+Definition cast_crash (ii : instr_info) (tdst : ctype) (te : texp) :
+  cexec (pexp (interp tdst)) :=
+  let: existT tsrc e := te in
   match ctype_eq_dec tsrc tdst with
-  | left h  => ecast t (pexp (interp t)) h e
-  | right _ => app_ (cst_ (fun v => jof_val tdst (jval tsrc v))) e
-  end.
-Arguments coerce : clear implicits.
-
-Definition cast_e (tdst : ctype) (te : texp) : pexp (interp tdst) :=
-  let: existT tsrc e := te in coerce tsrc tdst e.
-Arguments cast_e : clear implicits.
-
-(* [coerce_id] and [coerce_neq] characterise [coerce] completely.  The
-   first also covers what conversion cannot: an *abstract* [t], where
-   [ctype_eq_dec t t] is stuck.  [eq_irrelevance] applies since [ctype] is
-   an eqType. *)
-Lemma coerce_id (t : ctype) (e : pexp (interp t)) : coerce t t e = e.
-Proof.
-rewrite /coerce; case: (ctype_eq_dec t t) => [h|ne]; last by case: ne.
-by rewrite (eq_irrelevance h (erefl t)).
-Qed.
-
-Lemma coerce_neq (tsrc tdst : ctype) (e : pexp (interp tsrc)) :
-  tsrc <> tdst ->
-  coerce tsrc tdst e = app_ (cst_ (fun v => jof_val tdst (jval tsrc v))) e.
-Proof. by rewrite /coerce; case: ctype_eq_dec. Qed.
-
-Lemma cast_e_id (t : ctype) (e : pexp (interp t)) : cast_e t (mk_texp t e) = e.
-Proof. exact: coerce_id. Qed.
+   | left h  => ok (ecast t (pexp (interp t)) h e)
+   | right _ => Error (typing_error ii)
+   end.
 
 (* -------------------------------------------------------------------- *)
-(* Operator arguments, as one [expr_] over [values].
-
-   [expr_] can be instantiated at [value]/[values], but still not at
-   [exec _] or [sem_prod _ _], so operators are applied through a value
-   list with [app_sopn] / [app_sopn_v] inside a closure rather than by
-   currying [sem_prod]. *)
-Fixpoint pwargs_aux (ts : seq ctype) (tes : seq texp) : pexp values :=
+Fixpoint pwargs (ii : instr_info) (ts : seq ctype) (tes : seq texp) :
+  cexec (pexp values) :=
   match ts, tes with
   | t :: ts', te :: tes' =>
-      app_ (app_ (cst_ (@cons value)) (app_ (cst_ (jval t)) (cast_e t te)))
-           (pwargs_aux ts' tes')
-  | _, _ => cst_ [::]
+      Let te := cast_crash ii t te in
+      Let tes' := pwargs ii ts' tes' in
+      ok (app_ (app_ (cst_ (@cons value)) (app_ (cst_ (jval t)) te)) tes')
+   | [::], [::] => ok (cst_ [::])
+   | _, _ => Error (arity_error ii)
   end.
 
-Definition pwargs (ii : instr_info) (ts : seq ctype) (tes : seq texp) :
-    cexec (pexp values) :=
-  if size ts == size tes then ok (pwargs_aux ts tes)
-  else Error (arity_error ii).
-
-(* -------------------------------------------------------------------- *)
-(* 5. Expressions                                                       *)
-(* -------------------------------------------------------------------- *)
-
-(* There are no global variables, so the [Sglob] case is rejected rather
-   than translated -- [remove_globals] must have run. *)
 Definition pwgvar (ii : instr_info) (x : gvar) : cexec texp :=
   if x.(gs) is Slocal then
     let xv := (gv x).(v_var) in
     ok (mk_texp (eval_atype (jtype xv)) (var_ (pwvar xv)))
   else Error (global_error ii).
+
+(* -------------------------------------------------------------------- *)
+(* 5. Expressions                                                       *)
+(* -------------------------------------------------------------------- *)
+
+(* Expression should be normalized such that unsafe operator are part of a single
+   assign, such that x = a / b goes to if b = 0 then abort else x = a / b; *)
+
+Definition sem_sop1_typed (ii : instr_info) (o : sop1) :
+  let t := type_of_op1 o in
+  let t := (eval_atype t.1, eval_atype t.2) in
+  cexec (sem_t t.1 -> (sem_t t.2)) :=
+  match o with
+  | Oword_of_int sz => ok (wrepr sz)
+  | Oint_of_word sign sz => ok (@int_of_word sign sz)
+  | Osignext szo szi => ok (@sign_extend szo szi)
+  | Ozeroext szo szi => ok (@zero_extend szo szi)
+  | Onot => ok negb
+  | Olnot sz => ok (@wnot sz)
+  | Oneg Op_int => ok Z.opp
+  | Oneg (Op_w sz) => ok -%w
+  (* | Owi1 sign o => sem_wiop1_typed sign o *)
+  | _ => Error (unsafe_op ii)
+  end.
+
+Definition sem_sop2_typed (ii : instr_info) (o: sop2) :
+  let t := type_of_op2 o in
+  let t := (eval_atype t.1.1, eval_atype t.1.2, eval_atype t.2) in
+  cexec (sem_t t.1.1 -> sem_t t.1.2 -> sem_t t.2) :=
+  match o with
+  | Obeq => ok (@eq_op bool)
+  | Oand => ok andb
+  | Oor  => ok orb
+
+  | Oadd Op_int     => ok Z.add
+  | Oadd (Op_w s)   => ok +%w
+  | Omul Op_int     => ok Z.mul
+  | Omul (Op_w s)   => ok *%w
+  | Osub Op_int     => ok Z.sub
+  | Osub (Op_w s)   => ok (fun x y =>  x - y)%w
+  | Odiv u Op_int   => ok (signed Z.div Z.quot u)
+  (* | Odiv u (Op_w s) => @mk_sem_divmod u s (signed wdiv wdivi u) *)
+  | Omod u Op_int   => ok (signed Z.modulo Z.rem u)
+  (* | Omod u (Op_w s) => @mk_sem_divmod u s (signed wmod wmodi u) *)
+
+  | Oland s       => ok wand
+  | Olor  s       => ok wor
+  | Olxor s       => ok wxor
+  | Olsr s        => ok sem_shr
+  | Olsl Op_int   => ok zlsl
+  | Olsl (Op_w s) => ok sem_shl
+  | Oasr Op_int   => ok zasr
+  | Oasr (Op_w s) => ok sem_sar
+  | Oror s        => ok sem_ror
+  | Orol s        => ok sem_rol
+
+  | Oeq Op_int    => ok Z.eqb
+  | Oeq (Op_w s)  => ok eq_op
+  | Oneq Op_int   => ok (fun x y => negb (Z.eqb x y))
+  | Oneq (Op_w s) => ok (fun x y => (x != y))
+
+  (* Fixme use the "new" Z *)
+  | Olt Cmp_int   => ok Z.ltb
+  | Ole Cmp_int   => ok Z.leb
+  | Ogt Cmp_int   => ok Z.gtb
+  | Oge Cmp_int   => ok Z.geb
+
+  | Olt (Cmp_w u s) => ok (wlt u)
+  | Ole (Cmp_w u s) => ok (wle u)
+  | Ogt (Cmp_w u s) => ok (fun x y => wlt u y x)
+  | Oge (Cmp_w u s) => ok (fun x y => wle u y x)
+  | Ovadd ve ws     => ok (sem_vadd ve)
+  | Ovsub ve ws     => ok (sem_vsub ve)
+  | Ovmul ve ws     => ok (sem_vmul ve)
+  | Ovlsr ve ws     => ok (sem_vshr ve)
+  | Ovlsl ve ws     => ok (sem_vshl ve)
+  | Ovasr ve ws     => ok (sem_vsar ve)
+
+  (* | Owi2 s sz o => sem_wiop2_typed s sz o *)
+  | _ => Error (unsafe_op ii)
+  end.
+
 
 Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
   match e with
@@ -594,7 +550,7 @@ Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
   | Pget al aa ws x i =>
       Let ti := toEC_e ii i in
       Let tx := pwgvar ii x in
-      let ei := (cast_e cint ti) in
+      Let ei := cast_crash ii cint ti in
       let: existT t e := tx in
       (match t return pexp (interp t) -> cexec texp with
        | carr n  => fun e =>
@@ -609,7 +565,7 @@ Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
   | Psub aa ws len x i =>
       Let ti := toEC_e ii i in
       Let tx := pwgvar ii x in
-      let ei := (cast_e cint ti) in
+      Let ei := (cast_crash ii cint ti) in
       let: existT t e := tx in
       (match t return pexp (interp t) -> cexec texp with
        | carr n  => fun e =>
@@ -622,38 +578,38 @@ Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
        | _=> fun _ => Error (typing_error ii)
        end) e
 
-  (* Jasmin's memory is a single global slot whose code interprets to [mem]
-     itself, so loads are Jasmin's own [read]: validity and alignment are
-     modelled, not replaced by array bounds.  A failing read yields the
-     default word, per this file's total-denotation convention. *)
   | Pload al ws a =>
       Let ta := toEC_e ii a in
+      Let ta := cast_crash ii (cword Uptr) ta in
       ok (mk_texp (cword ws)
             (app_ (app_ (cst_ (fun (mm : mem) (p : word Uptr) =>
                                  rdflt 0%R (read mm al p ws)))
-                     (gvar_ memv))
-                  (cast_e (cword Uptr) ta)))
+                     (gvar_ memv)) ta))
 
   | Papp1 o e1 =>
       Let t1 := toEC_e ii e1 in
+      Let t1 := cast_crash ii (eval_atype (type_of_op1 o).1) t1 in
+      Let o' := sem_sop1_typed ii o in
       ok (mk_texp (eval_atype (type_of_op1 o).2)
             (app_ (cst_ (fun v =>
-                     tot (eval_atype (type_of_op1 o).2)
-                       (sem_sop1_typed o
+                     to_interp (eval_atype (type_of_op1 o).2)
+                       (o'
                           (of_interp (eval_atype (type_of_op1 o).1) v))))
-                  (cast_e (eval_atype (type_of_op1 o).1) t1)))
+                   t1))
 
   | Papp2 o e1 e2 =>
       Let t1 := toEC_e ii e1 in
+      Let t1 := cast_crash ii (eval_atype (type_of_op2 o).1.1) t1 in
       Let t2 := toEC_e ii e2 in
+      Let t2 := cast_crash ii (eval_atype (type_of_op2 o).1.2) t2 in
+      Let o' := sem_sop2_typed ii o in
       ok (mk_texp (eval_atype (type_of_op2 o).2)
             (app_ (app_ (cst_ (fun v1 v2 =>
-                       tot (eval_atype (type_of_op2 o).2)
-                         (sem_sop2_typed o
+                         to_interp (eval_atype (type_of_op2 o).2)
+                            (o'
                             (of_interp (eval_atype (type_of_op2 o).1.1) v1)
                             (of_interp (eval_atype (type_of_op2 o).1.2) v2))))
-                     (cast_e (eval_atype (type_of_op2 o).1.1) t1))
-                  (cast_e (eval_atype (type_of_op2 o).1.2) t2)))
+                     t1) t2))
 
   | PappN o es =>
       Let tes := mapM (toEC_e ii) es in
@@ -667,15 +623,16 @@ Fixpoint toEC_e (ii : instr_info) (e : pexpr) : cexec texp :=
 
   | Pif ty b e1 e2 =>
       Let tb := toEC_e ii b in
+      Let tb := cast_crash ii cbool tb in
       Let t1 := toEC_e ii e1 in
+      Let t1 := cast_crash ii (eval_atype ty) t1 in
       Let t2 := toEC_e ii e2 in
+      Let t2 := cast_crash ii (eval_atype ty) t2 in
       ok (mk_texp (eval_atype ty)
             (app_ (app_ (app_
                      (cst_ (fun (c : bool) (v1 v2 : interp (eval_atype ty)) =>
                               if c then v1 else v2))
-                     (cast_e cbool tb))
-                     (cast_e (eval_atype ty) t1))
-                  (cast_e (eval_atype ty) t2)))
+                     tb) t1) t2))
   end.
 
 Definition toEC_es (ii : instr_info) (es : pexprs) : cexec (seq texp) :=
@@ -686,32 +643,27 @@ Fixpoint toEC_assert (ii : instr_info) (a : eassert) : cexec (pexp bool) :=
   match a with
   | Pexpr e =>
       Let te := toEC_e ii e in
-      ok (cast_e cbool te)
+      Let te := cast_crash ii cbool te in
+      ok te
 
   | PappN_safety o es =>
       Let tes := toEC_es ii es in
       Let args := pwargs ii (map eval_atype (type_of_opN_safety o).1) tes in
       ok (app_ (cst_ (fun vs => rdflt false (sem_opN_safety o vs))) args)
 
-  (* [is_init x] reads [is_defined (evm s).[x]], and [interp t] has no
-     undefined inhabitant, so the predicate is not representable.  It is
-     rejected rather than approximated by [true]: [Cassert] compiles to
-     [cond b skip abort], so [true] would let the pwhile program run on
-     exactly where Jasmin aborts. *)
   | Pis_var_init _ => Error (init_error ii)
 
-  (* Transcribed from [sem_eassert] (psem_defs.v), which the old array
-     encoding of the memory could only stub as [cst_ true]. *)
   | Pis_mem_init e1 e2 =>
       Let t1 := toEC_e ii e1 in
+      Let t1 := cast_crash ii (cword Uptr) t1 in
       Let t2 := toEC_e ii e2 in
+      Let t2 := cast_crash ii cint t2 in
       ok (app_ (app_ (app_
                (cst_ (fun (mm : mem) (lo : word Uptr) (sz : Z) =>
                   all (fun i => is_ok (read mm Unaligned (lo + wrepr Uptr i)%w U8))
                       (ziota 0 sz)))
                (gvar_ memv))
-               (cast_e (cword Uptr) t1))
-            (cast_e cint t2))
+               t1) t2)
 
   | Pand a1 a2 =>
       Let b1 := toEC_assert ii a1 in
@@ -720,36 +672,21 @@ Fixpoint toEC_assert (ii : instr_info) (a : eassert) : cexec (pexp bool) :=
   end.
 
 (* -------------------------------------------------------------------- *)
-(* 6. Left-hand sides                                                  *)
+(* 6. Left-hand sides                                                   *)
 (* -------------------------------------------------------------------- *)
-
-(* Parallel assignment.  [block bs skip rs] evaluates [bs] in the *outer*
-   memory into a frame that [minit]'s [mnew] has just wiped, then [mret]
-   restores the outer locals and evaluates [rs] in that frame.  Reading
-   each bound variable straight back therefore performs a simultaneous
-   assignment -- with no auxiliary names to invent, and without
-   re-evaluating right-hand sides that a destination may clobber
-   ([normalize_calls] does not make destinations disjoint from the
-   arguments' reads). *)
-Definition pw_bind (x : var) (te : texp) : binding :=
-  bind_of (pwvar x) (cast_e (eval_atype (jtype x)) te).
-
-Definition passign (bs : seq binding) : pwcmd :=
-  pwhile.block bs pwhile.skip
-    (map (fun b => let: existT _ (x, _) := b in bind_of x (var_ x)) bs).
 
 Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd :=
   match lv with
   | Lnone _ _ => ok pwhile.skip
 
   | Lvar x =>
-      ok (pwhile.assign (pwvar x.(v_var))
-            (cast_e (eval_atype (jtype x.(v_var))) te))
+      Let te := cast_crash ii (eval_atype (jtype x.(v_var))) te in
+      ok (pwhile.assign (pwvar x.(v_var)) te)
 
   | Laset al aa ws x i =>
       Let ti := toEC_e ii i in
-      let ei := (cast_e cint ti) in
-      let ev := (cast_e (cword ws) te) in
+      Let ei := cast_crash ii cint ti in
+      Let ev := cast_crash ii (cword ws) te in
       (match eval_atype (jtype x) as c
              return vars_ jident c -> cexec pwcmd  with
        | carr n  => fun v =>
@@ -762,8 +699,8 @@ Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd :=
 
   | Lasub aa ws len x i =>
       Let ti := toEC_e ii i in
-      let ei := (cast_e cint ti) in
-      let ev := (cast_e (carr (arr_size ws len)) te) in
+      Let ei := cast_crash ii cint ti in
+      Let ev := cast_crash ii (carr (arr_size ws len)) te in
       (match eval_atype (jtype x) as c
              return vars_ jident c -> cexec pwcmd with
        | carr n  => fun v =>
@@ -775,29 +712,25 @@ Definition toEC_lv (ii : instr_info) (lv : lval) (te : texp) : cexec pwcmd :=
        | _ => fun _ => Error (typing_error ii)
        end) (pwvar x)
 
-  (* Stores go through Jasmin's own [write]; a write that fails validity or
-     alignment leaves the memory unchanged. *)
   | Lmem al ws _ a =>
       Let ta := toEC_e ii a in
+      Let ta := cast_crash ii (cword Uptr) ta in
+      Let te := cast_crash ii (cword ws) te in
       ok (pwhile.gassign memv
             (app_ (app_ (app_
                      (cst_ (fun (mm : mem) (p : word Uptr) (w : word ws) =>
                               rdflt mm (write mm al p w)))
                      (gvar_ memv))
-                     (cast_e (cword Uptr) ta))
-                  (cast_e (cword ws) te)))
+                     ta) te))
   end.
 
-Fixpoint toEC_lvs_seq (ii : instr_info) (lvs : lvals) (tes : seq texp) :
-    cexec pwcmd :=
-  match lvs, tes with
-  | [::], [::] => ok pwhile.skip
-  | lv :: lvs', te :: tes' =>
-      Let c1 := toEC_lv ii lv te in
-      Let c2 := toEC_lvs_seq ii lvs' tes' in
-      ok (pwhile.seqc c1 c2)
-  | _, _ => Error (arity_error ii)
-  end.
+Definition pw_bind (ii : instr_info) (x : var) (te : texp) : cexec binding :=
+  Let te := cast_crash ii (eval_atype (jtype x)) te in
+  ok (bind_of (pwvar x) te).
+
+Definition passign (bs : seq binding) : pwcmd :=
+  pwhile.block bs pwhile.skip
+    (map (fun b => let: existT _ (x, _) := b in bind_of x (var_ x)) bs).
 
 Fixpoint lvs_bindings (ii : instr_info) (lvs : lvals) (tes : seq texp) :
     cexec (seq binding) :=
@@ -805,15 +738,20 @@ Fixpoint lvs_bindings (ii : instr_info) (lvs : lvals) (tes : seq texp) :
   | [::], [::] => ok [::]
   | Lvar x :: lvs', te :: tes' =>
       Let bs := lvs_bindings ii lvs' tes' in
-      ok (pw_bind x.(v_var) te :: bs)
-  | _ :: _, _ :: _ => Error (dest_error ii)
+      Let te := pw_bind ii x.(v_var) te in
+      ok ( te :: bs)
   | _, _ => Error (arity_error ii)
   end.
 
-Definition toEC_lvs (ii : instr_info) (lvs : lvals) (tes : seq texp) :
+Fixpoint toEC_lvs (ii : instr_info) (lvs : lvals) (tes : seq texp) :
     cexec pwcmd :=
-  if (size lvs <= 1)%nat then toEC_lvs_seq ii lvs tes
-  else Let bs := lvs_bindings ii lvs tes in ok (passign bs).
+  match lvs, tes with
+  | [::], [::] => ok pwhile.skip
+  | lv :: [::], te :: [::] => toEC_lv ii lv te
+  | _, _ =>
+      Let bs := lvs_bindings ii lvs tes in
+      ok (passign bs)
+  end.
 
 Definition rand_assign (ii : instr_info) (x : var) : cexec pwcmd :=
   (match eval_atype (jtype x) as c
@@ -823,14 +761,14 @@ Definition rand_assign (ii : instr_info) (x : var) : cexec pwcmd :=
    end) (pwvar x).
 
 (* -------------------------------------------------------------------- *)
-(* 7. Instructions                                                     *)
+(* 7. Instructions                                                      *)
 (* -------------------------------------------------------------------- *)
 
 Definition call_cmd (fd : _ufundef) (fn : funname) (ii : instr_info)
     (lvs : lvals) (tes : seq texp) : cexec pwcmd :=
   Let bs :=
     mapM2 (arity_error ii)
-      (fun (x : var_i) (te : texp) => ok (pw_bind x.(v_var) te))
+      (fun (x : var_i) (te : texp) => pw_bind ii x.(v_var) te)
       fd.(f_params) tes
   in
   let res : seq texp :=
@@ -861,7 +799,8 @@ Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd :=
   match ir with
   | Cassgn lv _ ty e =>
       Let te := toEC_e ii e in
-      toEC_lv ii lv (mk_texp (eval_atype ty) (cast_e (eval_atype ty) te))
+      Let te := cast_crash ii (eval_atype ty) te in
+      toEC_lv ii lv (mk_texp (eval_atype ty) te)
 
   | Copn lvs _ o es =>
       Let tes := toEC_es ii es in
@@ -890,17 +829,19 @@ Fixpoint toEC_i (p : _uprog) (i : instr) : cexec pwcmd :=
 
   | Cif e c1 c2 =>
       Let te := toEC_e ii e in
+      Let te := cast_crash ii cbool te in
       Let d1 := toEC_c_aux (toEC_i p) c1 in
       Let d2 := toEC_c_aux (toEC_i p) c2 in
-      ok (pwhile.cond (cast_e cbool te) d1 d2)
+      ok (pwhile.cond te d1 d2)
 
   | Cfor _ _ _ => Error (cfor_error ii)
 
   | Cwhile _ c1 e _ c2 =>
       if c1 is [::] then
         Let te := toEC_e ii e in
+        Let te := cast_crash ii cbool te in
         Let d2 := toEC_c_aux (toEC_i p) c2 in
-        ok (pwhile.while (cast_e cbool te) d2)
+        ok (pwhile.while te d2)
       else Error (cwhile_error ii)
 
   | Ccall lvs fn es =>
